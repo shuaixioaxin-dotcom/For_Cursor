@@ -1,0 +1,9 @@
+# Linux端接收程序依赖
+# 安装: pip install -r requirements.txt
+
+# 可选: MQTT支持
+paho-mqtt>=1.6.0
+
+# 可选: 数据可视化
+# matplotlib>=3.5.0
+# numpy>=1.21.0
