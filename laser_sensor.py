@@ -224,13 +224,14 @@ class LaserSensor:
         if not self.connect():
             return
         
-        print("\n开始读取传感器数据... (按 Ctrl+C 停止)\n")
+        print("\n开始读取传感器数据... (按 Ctrl+C 停止)")
+        print("注意: AMP < 100 的数据帧将被丢弃\n")
         print("-" * 70)
         print(f"{'时间戳':<12} {'距离':<10} {'AMP':<10} {'AMP状态':<12} {'温度原始值':<10}")
         print("-" * 70)
         
-        frame_count = 0
-        error_count = 0
+        valid_frame_count = 0
+        discarded_frame_count = 0
         last_print_time = 0
         
         try:
@@ -238,19 +239,20 @@ class LaserSensor:
                 data = self.read_frame()
                 
                 if data:
-                    frame_count += 1
+                    # AMP低于100时丢弃该帧，不进行处理
+                    if data.amp < 100:
+                        discarded_frame_count += 1
+                        continue
+                    
+                    valid_frame_count += 1
                     current_time = time.time()
                     
                     # 控制输出频率
                     if interval == 0 or (current_time - last_print_time) >= interval:
                         timestamp = time.strftime("%H:%M:%S")
                         
-                        # 根据AMP状态设置颜色标记
-                        status_marker = ""
-                        if data.amp_status == AmpStatus.UNUSABLE:
-                            status_marker = " ⚠️"
-                        elif data.amp_status == AmpStatus.OPTIMAL:
-                            status_marker = " ✓"
+                        # 根据AMP状态设置标记
+                        status_marker = " ✓" if data.amp_status == AmpStatus.OPTIMAL else ""
                         
                         print(f"{timestamp:<12} {data.distance:<10} {data.amp:<10} "
                               f"{data.amp_status.value:<10}{status_marker} {data.temperature:<10}", end="")
@@ -267,7 +269,7 @@ class LaserSensor:
                 
         except KeyboardInterrupt:
             print("\n" + "-" * 70)
-            print(f"\n停止读取. 总帧数: {frame_count}, 错误帧数: {error_count}")
+            print(f"\n停止读取. 有效帧数: {valid_frame_count}, 丢弃帧数(AMP<100): {discarded_frame_count}")
         finally:
             self.disconnect()
 
@@ -299,23 +301,39 @@ def run_test():
     print("=" * 70)
     print("测试模式 - 测试帧解析功能")
     print("=" * 70)
+    print("注意: AMP < 100 的数据帧将被丢弃，不进行计算")
     
     # 测试用例
     test_cases = [
         # 正常帧 - 距离=1000, AMP=500 (最佳)
         {
             "name": "正常帧 (AMP=500, 最佳)",
-            "frame": bytes([0x59, 0x59, 0xE8, 0x03, 0xF4, 0x01, 0x00, 0x00, 0x00]),  # 校验和待计算
+            "frame": bytes([0x59, 0x59, 0xE8, 0x03, 0xF4, 0x01, 0x00, 0x00, 0x00]),
+            "should_discard": False,
         },
-        # AMP=50 (不可用)
+        # AMP=50 (不可用 - 应丢弃)
         {
-            "name": "低AMP帧 (AMP=50, 不可用)",
+            "name": "低AMP帧 (AMP=50, 应丢弃)",
             "frame": bytes([0x59, 0x59, 0x64, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00]),
+            "should_discard": True,
         },
         # AMP=200 (可接受)
         {
             "name": "中等AMP帧 (AMP=200, 可接受)",
             "frame": bytes([0x59, 0x59, 0xC8, 0x00, 0xC8, 0x00, 0x00, 0x00, 0x00]),
+            "should_discard": False,
+        },
+        # AMP=99 (边界值 - 应丢弃)
+        {
+            "name": "边界值帧 (AMP=99, 应丢弃)",
+            "frame": bytes([0x59, 0x59, 0x64, 0x00, 0x63, 0x00, 0x00, 0x00, 0x00]),
+            "should_discard": True,
+        },
+        # AMP=100 (边界值 - 保留)
+        {
+            "name": "边界值帧 (AMP=100, 保留)",
+            "frame": bytes([0x59, 0x59, 0x64, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00]),
+            "should_discard": False,
         },
     ]
     
@@ -331,10 +349,22 @@ def run_test():
         
         data = parse_frame(frame)
         if data:
-            print(f"  距离: {data.distance}")
-            print(f"  AMP: {data.amp}")
-            print(f"  AMP状态: {data.amp_status.value}")
-            print(f"  温度原始值: {data.temperature}")
+            # 检查是否应该丢弃
+            if data.amp < 100:
+                print(f"  ⚠️ 丢弃: AMP={data.amp} < 100，数据无效")
+                if tc["should_discard"]:
+                    print("  ✓ 测试通过: 正确识别为应丢弃")
+                else:
+                    print("  ✗ 测试失败: 不应该被丢弃")
+            else:
+                print(f"  距离: {data.distance}")
+                print(f"  AMP: {data.amp}")
+                print(f"  AMP状态: {data.amp_status.value}")
+                print(f"  温度原始值: {data.temperature}")
+                if not tc["should_discard"]:
+                    print("  ✓ 测试通过: 正确保留有效数据")
+                else:
+                    print("  ✗ 测试失败: 应该被丢弃")
         else:
             print("  解析失败!")
     
