@@ -277,10 +277,10 @@ static void send_combined_data(void)
                               "  MAG: %.3f, %.3f, %.3f (uT)\r\n",
                               ch->raw.hi91.mag[0], ch->raw.hi91.mag[1], ch->raw.hi91.mag[2]);
             
-            /* Add euler angles */
+            /* Add euler angles (eul[]: roll, pitch, yaw) */
             offset += snprintf(combined_log_buf + offset, COMBINED_LOG_SIZE - offset,
                               "  EULER: Roll=%.2f, Pitch=%.2f, Yaw=%.2f (deg)\r\n",
-                              ch->raw.hi91.euler[0], ch->raw.hi91.euler[1], ch->raw.hi91.euler[2]);
+                              ch->raw.hi91.eul[0], ch->raw.hi91.eul[1], ch->raw.hi91.eul[2]);
             
             /* Add quaternion */
             offset += snprintf(combined_log_buf + offset, COMBINED_LOG_SIZE - offset,
@@ -291,7 +291,7 @@ static void send_combined_data(void)
             /* Add pressure and timestamp if available */
             offset += snprintf(combined_log_buf + offset, COMBINED_LOG_SIZE - offset,
                               "  PRES: %.2f Pa, TS: %u ms\r\n",
-                              ch->raw.hi91.prs, ch->raw.hi91.ts);
+                              ch->raw.hi91.air_press, ch->raw.hi91.sync_time);
         }
         else
         {

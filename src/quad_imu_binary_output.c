@@ -136,7 +136,7 @@ int pack_imu_binary_packet(hipnuc_raw_t *imu_raw_array[], uint8_t valid_flags[],
             imu_data_block_t *block = (imu_data_block_t *)(out_buf + offset);
             hipnuc_raw_t *raw = imu_raw_array[i];
             
-            block->timestamp = raw->hi91.ts;
+            block->timestamp = raw->hi91.sync_time;
             
             block->acc[0] = raw->hi91.acc[0];
             block->acc[1] = raw->hi91.acc[1];
@@ -150,16 +150,17 @@ int pack_imu_binary_packet(hipnuc_raw_t *imu_raw_array[], uint8_t valid_flags[],
             block->mag[1] = raw->hi91.mag[1];
             block->mag[2] = raw->hi91.mag[2];
             
-            block->euler[0] = raw->hi91.euler[0];
-            block->euler[1] = raw->hi91.euler[1];
-            block->euler[2] = raw->hi91.euler[2];
+            /* Euler angles: use eul[] array (roll, pitch, yaw) */
+            block->euler[0] = raw->hi91.eul[0];
+            block->euler[1] = raw->hi91.eul[1];
+            block->euler[2] = raw->hi91.eul[2];
             
             block->quat[0] = raw->hi91.quat[0];
             block->quat[1] = raw->hi91.quat[1];
             block->quat[2] = raw->hi91.quat[2];
             block->quat[3] = raw->hi91.quat[3];
             
-            block->pressure = raw->hi91.prs;
+            block->pressure = raw->hi91.air_press;
             
             offset += sizeof(imu_data_block_t);
         }
