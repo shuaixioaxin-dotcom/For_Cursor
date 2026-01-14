@@ -60,6 +60,8 @@
 #define GROUP_TIMEOUT_US      50000u
 /* 没有成组输出时，周期性打印状态，避免“看起来没数据” */
 #define STATUS_PERIOD_US      1000000u
+/* 每路缓存帧队列深度：提升匹配成功率（RAM 允许可加大） */
+#define FRAME_QUEUE_DEPTH     4u
 
 typedef struct
 {
@@ -83,17 +85,29 @@ static imu_port_t g_imus[IMU_PORT_COUNT];
 static char log_buf[LOG_STRING_SIZE];
 static char combined_log[COMBINED_LOG_SIZE];
 
-/* 每路最新一帧的字符串与长度缓存，用于“4 组合并输出” */
-static char imu_log[IMU_PORT_COUNT][LOG_STRING_SIZE];
-static uint16_t imu_frame_len[IMU_PORT_COUNT];
-static uint8_t imu_updated[IMU_PORT_COUNT];
-static uint32_t imu_ts_us[IMU_PORT_COUNT];
+typedef struct
+{
+    hipnuc_raw_t raw;
+    uint16_t len;
+    uint32_t ts_us;
+} imu_frame_t;
+
+typedef struct
+{
+    imu_frame_t q[FRAME_QUEUE_DEPTH];
+    uint8_t head;
+    uint8_t tail;
+    uint8_t count;
+} frame_queue_t;
+
+/* 每路帧队列：用于严格窗口内对齐匹配 */
+static frame_queue_t g_fq[IMU_PORT_COUNT];
+
 static uint32_t g_group_seq = 0;
 static uint32_t g_last_status_us = 0;
 static uint32_t g_frame_ok_cnt[IMU_PORT_COUNT];
 static uint32_t g_sync_drop_cnt = 0;
 static uint32_t g_sync_timeout_cnt = 0;
-static uint32_t g_group_start_us = 0;
 static uint32_t g_last_timeout_log_us = 0;
 
 /* -------- 时间戳：使用 TIM2 1MHz 自由运行计数（不使用 DWT） -------- */
@@ -138,7 +152,7 @@ static void DMA_Configuration(void);
 static void app_init(void);
 static void printf_welcome_information(void);
 static void process_data(void);
-static void try_emit_group(void);
+static void try_emit_groups(void);
 
 static inline uint16_t rb_next(uint16_t v)
 {
@@ -235,16 +249,12 @@ static void app_init(void)
         g_imus[i].rb.overflow_cnt = 0;
     }
 
-    memset(imu_log, 0, sizeof(imu_log));
-    memset(imu_frame_len, 0, sizeof(imu_frame_len));
-    memset(imu_updated, 0, sizeof(imu_updated));
-    memset(imu_ts_us, 0, sizeof(imu_ts_us));
+    memset(g_fq, 0, sizeof(g_fq));
     g_group_seq = 0;
     g_last_status_us = 0;
     memset(g_frame_ok_cnt, 0, sizeof(g_frame_ok_cnt));
     g_sync_drop_cnt = 0;
     g_sync_timeout_cnt = 0;
-    g_group_start_us = 0;
     g_last_timeout_log_us = 0;
 
     /* USART1: debug output; USART2/3/4/5: IMU reception */
@@ -275,33 +285,74 @@ static void printf_welcome_information(void)
     printf("Sync window: %lu us, timeout: %lu us\r\n",
            (unsigned long)SYNC_WINDOW_US,
            (unsigned long)GROUP_TIMEOUT_US);
+    printf("Frame queue depth: %lu\r\n", (unsigned long)FRAME_QUEUE_DEPTH);
 }
 
-static int all_imus_updated(void)
+static inline uint8_t fq_next(uint8_t v)
+{
+    return (uint8_t)((v + 1u) % FRAME_QUEUE_DEPTH);
+}
+
+static void fq_push(uint8_t imu, const hipnuc_raw_t *raw, uint16_t len, uint32_t ts_us)
+{
+    frame_queue_t *fq = &g_fq[imu];
+
+    /* 满了则丢弃最旧的，保证能继续前进 */
+    if (fq->count >= FRAME_QUEUE_DEPTH)
+    {
+        fq->head = fq_next(fq->head);
+        fq->count--;
+        g_sync_drop_cnt++;
+    }
+
+    imu_frame_t *slot = &fq->q[fq->tail];
+    memcpy(&slot->raw, raw, sizeof(hipnuc_raw_t));
+    slot->len = len;
+    slot->ts_us = ts_us;
+
+    fq->tail = fq_next(fq->tail);
+    fq->count++;
+}
+
+static int fq_peek(uint8_t imu, imu_frame_t *out)
+{
+    frame_queue_t *fq = &g_fq[imu];
+    if (fq->count == 0u)
+        return 0;
+    *out = fq->q[fq->head];
+    return 1;
+}
+
+static int fq_pop(uint8_t imu, imu_frame_t *out)
+{
+    frame_queue_t *fq = &g_fq[imu];
+    if (fq->count == 0u)
+        return 0;
+    *out = fq->q[fq->head];
+    fq->head = fq_next(fq->head);
+    fq->count--;
+    return 1;
+}
+
+static int all_queues_nonempty(void)
 {
     for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
     {
-        if (!imu_updated[i])
+        if (g_fq[i].count == 0u)
             return 0;
     }
     return 1;
 }
 
-static void clear_imu_updated(void)
-{
-    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
-        imu_updated[i] = 0;
-}
-
-static void print_combined_group(void)
+static void print_combined_group(const imu_frame_t frames[IMU_PORT_COUNT])
 {
     size_t off = 0;
 
-    uint32_t min_ts = imu_ts_us[0], max_ts = imu_ts_us[0];
+    uint32_t min_ts = frames[0].ts_us, max_ts = frames[0].ts_us;
     for (uint8_t i = 1; i < IMU_PORT_COUNT; i++)
     {
-        if (imu_ts_us[i] < min_ts) min_ts = imu_ts_us[i];
-        if (imu_ts_us[i] > max_ts) max_ts = imu_ts_us[i];
+        if (frames[i].ts_us < min_ts) min_ts = frames[i].ts_us;
+        if (frames[i].ts_us > max_ts) max_ts = frames[i].ts_us;
     }
 
     off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
@@ -311,12 +362,14 @@ static void print_combined_group(void)
 
     for (uint8_t imu = 0; imu < IMU_PORT_COUNT; imu++)
     {
+        /* 按组打印时再生成字符串，避免每路缓存大量字符串 */
+        hipnuc_dump_packet((hipnuc_raw_t *)&frames[imu].raw, log_buf, sizeof(log_buf));
         off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
                                 "[IMU%u] t=%luus frame_len:%u\r\n%s\r\n",
                                 (unsigned int)(imu + 1u),
-                                (unsigned long)imu_ts_us[imu],
-                                (unsigned int)imu_frame_len[imu],
-                                imu_log[imu]);
+                                (unsigned long)frames[imu].ts_us,
+                                (unsigned int)frames[imu].len,
+                                log_buf);
         if (off >= sizeof(combined_log))
         {
             off = sizeof(combined_log) - 1u;
@@ -330,73 +383,88 @@ static void print_combined_group(void)
     printf("%s", combined_log);
 }
 
-static void drop_oldest_frame(void)
+static void drop_oldest_head_frame(void)
 {
     uint8_t oldest = 0;
     uint32_t min_ts = 0xFFFFFFFFu;
     for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
     {
-        if (imu_updated[i] && imu_ts_us[i] < min_ts)
+        if (g_fq[i].count == 0u)
+            continue;
+        uint32_t ts = g_fq[i].q[g_fq[i].head].ts_us;
+        if (ts < min_ts)
         {
-            min_ts = imu_ts_us[i];
+            min_ts = ts;
             oldest = i;
         }
     }
-    imu_updated[oldest] = 0;
+
+    imu_frame_t dummy;
+    (void)fq_pop(oldest, &dummy);
     g_sync_drop_cnt++;
 }
 
-static void try_emit_group(void)
+static void try_emit_groups(void)
 {
     /*
      * 严格同步策略：
-     * - 必须 4 路都有“最新帧”；
-     * - 若 4 路时间戳 max-min <= SYNC_WINDOW_US，则认为同一时刻，合并输出；
-     * - 否则丢弃最旧的一帧（时间戳最小那路），等待更“新”的帧进入对齐窗口；
-     * - 若一直凑不齐（或窗口太严），当已收帧的最老帧等待超过 GROUP_TIMEOUT_US，则清空重新对齐。
+     * - 每路用小 FIFO 缓存多帧，提升可匹配概率（避免某一路连发覆盖掉可匹配帧）。
+     * - 当 4 路队列头部帧时间戳 max-min <= SYNC_WINDOW_US，则输出一组并各 pop 1 帧。
+     * - 否则 pop 掉最旧的队列头帧继续追齐。
+     * - 若最旧帧等待超过 GROUP_TIMEOUT_US，则丢弃最旧帧并记录 timeout（防止长期卡住）。
      */
 
     uint32_t now = micros_now();
 
-    /*
-     * 超时：按“本组开始时间”计时，而不是按某一路帧时间戳计时。
-     * 否则当某一路长期缺失时，会在高帧率输入下频繁触发超时打印刷屏。
-     */
-    if (g_group_start_us != 0u && (uint32_t)(now - g_group_start_us) > GROUP_TIMEOUT_US)
+    /* 超时：若存在任何缓存帧太老，则丢弃最旧帧并计数（限频打印） */
+    uint32_t oldest_ts = 0xFFFFFFFFu;
+    uint8_t has_any = 0;
+    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
     {
-        clear_imu_updated();
-        g_group_start_us = 0u;
-        g_sync_timeout_cnt++;
+        if (g_fq[i].count == 0u)
+            continue;
+        has_any = 1;
+        uint32_t ts = g_fq[i].q[g_fq[i].head].ts_us;
+        if (ts < oldest_ts)
+            oldest_ts = ts;
+    }
 
-        /* 限频打印：避免刷屏（例如每 1 秒最多打印一次） */
+    if (has_any && (uint32_t)(now - oldest_ts) > GROUP_TIMEOUT_US)
+    {
+        drop_oldest_head_frame();
+        g_sync_timeout_cnt++;
         if ((uint32_t)(now - g_last_timeout_log_us) >= STATUS_PERIOD_US)
         {
             g_last_timeout_log_us = now;
-            printf("[SYNC] timeout resync (missing/late IMU frames)\r\n");
+            printf("[SYNC] timeout drop oldest frame (missing/late IMU frames)\r\n");
         }
-        return;
     }
 
-    while (all_imus_updated())
+    while (all_queues_nonempty())
     {
-        uint32_t min_ts = imu_ts_us[0], max_ts = imu_ts_us[0];
+        imu_frame_t heads[IMU_PORT_COUNT];
+        for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
+            (void)fq_peek(i, &heads[i]);
+
+        uint32_t min_ts = heads[0].ts_us, max_ts = heads[0].ts_us;
         for (uint8_t i = 1; i < IMU_PORT_COUNT; i++)
         {
-            if (imu_ts_us[i] < min_ts) min_ts = imu_ts_us[i];
-            if (imu_ts_us[i] > max_ts) max_ts = imu_ts_us[i];
+            if (heads[i].ts_us < min_ts) min_ts = heads[i].ts_us;
+            if (heads[i].ts_us > max_ts) max_ts = heads[i].ts_us;
         }
 
         if ((max_ts - min_ts) <= SYNC_WINDOW_US)
         {
-            print_combined_group();
+            imu_frame_t frames[IMU_PORT_COUNT];
+            for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
+                (void)fq_pop(i, &frames[i]);
+            print_combined_group(frames);
             g_group_seq++;
-            clear_imu_updated();
-            g_group_start_us = 0u;
-            return;
         }
-
-        /* 不在窗口内：丢弃最旧帧，继续尝试对齐 */
-        drop_oldest_frame();
+        else
+        {
+            drop_oldest_head_frame();
+        }
     }
 }
 
@@ -410,19 +478,19 @@ static void print_status_if_needed(void)
     uint8_t miss_mask = 0;
     for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
     {
-        if (!imu_updated[i])
+        if (g_fq[i].count == 0u)
             miss_mask |= (uint8_t)(1u << i);
     }
 
-    printf("[STAT] ok_cnt:%lu %lu %lu %lu | updated:%u%u%u%u | miss_mask:0x%02X | ovf:%lu %lu %lu %lu | drop:%lu timeout:%lu\r\n",
+    printf("[STAT] ok_cnt:%lu %lu %lu %lu | q_cnt:%u %u %u %u | miss_mask:0x%02X | ovf:%lu %lu %lu %lu | drop:%lu timeout:%lu\r\n",
            (unsigned long)g_frame_ok_cnt[0],
            (unsigned long)g_frame_ok_cnt[1],
            (unsigned long)g_frame_ok_cnt[2],
            (unsigned long)g_frame_ok_cnt[3],
-           (unsigned int)imu_updated[0],
-           (unsigned int)imu_updated[1],
-           (unsigned int)imu_updated[2],
-           (unsigned int)imu_updated[3],
+           (unsigned int)g_fq[0].count,
+           (unsigned int)g_fq[1].count,
+           (unsigned int)g_fq[2].count,
+           (unsigned int)g_fq[3].count,
            (unsigned int)miss_mask,
            (unsigned long)g_imus[0].rb.overflow_cnt,
            (unsigned long)g_imus[1].rb.overflow_cnt,
@@ -447,18 +515,11 @@ static void process_data(void)
                 hipnuc_dump_packet(&g_imus[imu].raw, log_buf, sizeof(log_buf));
                 g_frame_ok_cnt[imu]++;
 
-                /* 缓存“最新一帧”到对应 IMU 槽位 */
-                imu_frame_len[imu] = (uint16_t)g_imus[imu].raw.len;
-                (void)snprintf(imu_log[imu], sizeof(imu_log[imu]), "%s", log_buf);
-                imu_updated[imu] = 1;
-                imu_ts_us[imu] = micros_now();
+                /* 入队：保存原始解析结果（严格同步用队列对齐） */
+                fq_push(imu, &g_imus[imu].raw, (uint16_t)g_imus[imu].raw.len, micros_now());
 
-                /* 记录本组开始时间（第一帧到达时刻） */
-                if (g_group_start_us == 0u)
-                    g_group_start_us = imu_ts_us[imu];
-
-                /* 每次有新帧进入就尝试凑组（严格窗口对齐） */
-                try_emit_group();
+                /* 有新帧就尝试匹配输出 */
+                try_emit_groups();
             }
         }
     }
