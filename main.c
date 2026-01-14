@@ -53,6 +53,10 @@
 #define COMBINED_LOG_SIZE     8192
 /* 单次主循环每路最多处理的字节数，避免单路刷屏导致其他路饥饿 */
 #define MAX_BYTES_PER_LOOP    256
+/* 严格同步窗口：4 路时间戳 max-min 必须 <= 该窗口才允许输出 */
+#define SYNC_WINDOW_US        3000u
+/* 若一直凑不齐 4 路，超过该超时则丢弃并重新对齐 */
+#define GROUP_TIMEOUT_US      50000u
 
 typedef struct
 {
@@ -80,6 +84,36 @@ static char combined_log[COMBINED_LOG_SIZE];
 static char imu_log[IMU_PORT_COUNT][LOG_STRING_SIZE];
 static uint16_t imu_frame_len[IMU_PORT_COUNT];
 static uint8_t imu_updated[IMU_PORT_COUNT];
+static uint32_t imu_ts_us[IMU_PORT_COUNT];
+static uint32_t g_group_seq = 0;
+
+/* -------- 时间戳：使用 Cortex-M3 DWT_CYCCNT（不依赖 SysTick/delay 实现） -------- */
+static uint8_t dwt_ready = 0;
+
+static void dwt_init(void)
+{
+    /*
+     * Cortex-M3: DWT CYCCNT 可用作高精度时间戳。
+     * 注意：部分量产固件可能关闭 DWT；此处尽量启用，失败则退化为 0 时间戳（同步会退化）。
+     */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    dwt_ready = (DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) ? 1u : 0u;
+}
+
+static uint32_t micros_now(void)
+{
+    if (!dwt_ready)
+        return 0;
+
+    /* 基于 SystemCoreClock 转换：us = cycles / (SystemCoreClock/1e6) */
+    uint32_t cycles = DWT->CYCCNT;
+    uint32_t div = (uint32_t)(SystemCoreClock / 1000000u);
+    if (div == 0u)
+        return 0;
+    return cycles / div;
+}
 
 /* Function prototypes */
 static void USART_Configuration(uint32_t usart1_baud, uint32_t imu_baud);
@@ -87,6 +121,7 @@ static void DMA_Configuration(void);
 static void app_init(void);
 static void printf_welcome_information(void);
 static void process_data(void);
+static void try_emit_group(void);
 
 static inline uint16_t rb_next(uint16_t v)
 {
@@ -162,6 +197,9 @@ static void app_init(void)
 
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
 
+    SystemCoreClockUpdate();
+    dwt_init();
+
     /*
      * 重要：4 个 IMU 是自发发送的，可能在上电后立刻产生串口中断。
      * 因此必须先完成 g_imus[] 的指针/缓冲初始化，再开启各串口中断，避免 ISR 访问未初始化对象导致 HardFault。
@@ -183,6 +221,8 @@ static void app_init(void)
     memset(imu_log, 0, sizeof(imu_log));
     memset(imu_frame_len, 0, sizeof(imu_frame_len));
     memset(imu_updated, 0, sizeof(imu_updated));
+    memset(imu_ts_us, 0, sizeof(imu_ts_us));
+    g_group_seq = 0;
 
     /* USART1: debug output; USART2/3/4/5: IMU reception */
     USART_Configuration(USART1_BAUD, IMU_BAUD);
@@ -209,6 +249,9 @@ static void printf_welcome_information(void)
     printf("System Clock Frequencies:\r\n");
     printf("SYSCLK: %lu Hz\r\n", (unsigned long)RCC_Clocks.SYSCLK_Frequency);
     printf("HCLK: %lu Hz\r\n", (unsigned long)RCC_Clocks.HCLK_Frequency);
+    printf("Sync window: %lu us, timeout: %lu us\r\n",
+           (unsigned long)SYNC_WINDOW_US,
+           (unsigned long)GROUP_TIMEOUT_US);
 }
 
 static int all_imus_updated(void)
@@ -231,14 +274,24 @@ static void print_combined_group(void)
 {
     size_t off = 0;
 
+    uint32_t min_ts = imu_ts_us[0], max_ts = imu_ts_us[0];
+    for (uint8_t i = 1; i < IMU_PORT_COUNT; i++)
+    {
+        if (imu_ts_us[i] < min_ts) min_ts = imu_ts_us[i];
+        if (imu_ts_us[i] > max_ts) max_ts = imu_ts_us[i];
+    }
+
     off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
-                            "=== IMU GROUP BEGIN ===\r\n");
+                            "=== IMU GROUP #%lu dt=%luus ===\r\n",
+                            (unsigned long)g_group_seq,
+                            (unsigned long)(max_ts - min_ts));
 
     for (uint8_t imu = 0; imu < IMU_PORT_COUNT; imu++)
     {
         off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
-                                "[IMU%u] frame_len:%u\r\n%s\r\n",
+                                "[IMU%u] t=%luus frame_len:%u\r\n%s\r\n",
                                 (unsigned int)(imu + 1u),
+                                (unsigned long)imu_ts_us[imu],
                                 (unsigned int)imu_frame_len[imu],
                                 imu_log[imu]);
         if (off >= sizeof(combined_log))
@@ -249,10 +302,68 @@ static void print_combined_group(void)
         }
     }
 
-    off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
-                            "=== IMU GROUP END ===\r\n\r\n");
+    off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off, "\r\n");
 
     printf("%s", combined_log);
+}
+
+static void drop_oldest_frame(void)
+{
+    uint8_t oldest = 0;
+    uint32_t min_ts = 0xFFFFFFFFu;
+    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
+    {
+        if (imu_updated[i] && imu_ts_us[i] < min_ts)
+        {
+            min_ts = imu_ts_us[i];
+            oldest = i;
+        }
+    }
+    imu_updated[oldest] = 0;
+}
+
+static void try_emit_group(void)
+{
+    /*
+     * 严格同步策略：
+     * - 必须 4 路都有“最新帧”；
+     * - 若 4 路时间戳 max-min <= SYNC_WINDOW_US，则认为同一时刻，合并输出；
+     * - 否则丢弃最旧的一帧（时间戳最小那路），等待更“新”的帧进入对齐窗口；
+     * - 若一直凑不齐（或窗口太严），当已收帧的最老帧等待超过 GROUP_TIMEOUT_US，则清空重新对齐。
+     */
+
+    uint32_t now = micros_now();
+
+    /* 超时：只要有任何已更新帧“等太久”，就整体清掉重来 */
+    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
+    {
+        if (imu_updated[i] && (now - imu_ts_us[i] > GROUP_TIMEOUT_US))
+        {
+            clear_imu_updated();
+            return;
+        }
+    }
+
+    while (all_imus_updated())
+    {
+        uint32_t min_ts = imu_ts_us[0], max_ts = imu_ts_us[0];
+        for (uint8_t i = 1; i < IMU_PORT_COUNT; i++)
+        {
+            if (imu_ts_us[i] < min_ts) min_ts = imu_ts_us[i];
+            if (imu_ts_us[i] > max_ts) max_ts = imu_ts_us[i];
+        }
+
+        if ((max_ts - min_ts) <= SYNC_WINDOW_US)
+        {
+            print_combined_group();
+            g_group_seq++;
+            clear_imu_updated();
+            return;
+        }
+
+        /* 不在窗口内：丢弃最旧帧，继续尝试对齐 */
+        drop_oldest_frame();
+    }
 }
 
 static void process_data(void)
@@ -273,13 +384,10 @@ static void process_data(void)
                 imu_frame_len[imu] = (uint16_t)g_imus[imu].raw.len;
                 (void)snprintf(imu_log[imu], sizeof(imu_log[imu]), "%s", log_buf);
                 imu_updated[imu] = 1;
+                imu_ts_us[imu] = micros_now();
 
-                /* 当 4 路都更新后，再合并输出一组 */
-                if (all_imus_updated())
-                {
-                    print_combined_group();
-                    clear_imu_updated();
-                }
+                /* 每次有新帧进入就尝试凑组（严格窗口对齐） */
+                try_emit_group();
             }
         }
     }
