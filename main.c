@@ -16,7 +16,7 @@
  * - ENABLE_USART_DMA: Set to 0 (DMA not implemented for all channels in this multi-IMU example to save resources/complexity)
  * 
  * @date 2024-08-07
- * @version 1.1
+ * @version 1.2
  */
  
 #include "delay.h"
@@ -43,7 +43,10 @@
 static hipnuc_raw_t hipnuc_raw[IMU_COUNT];
 
 /* Data arrived flags: 0: no new data, 1: new data */
-static volatile uint8_t new_data_flag[IMU_COUNT] = {0};         
+static volatile uint8_t new_data_flag[IMU_COUNT] = {0};
+
+/* Processed packet ready flags */
+static uint8_t packet_ready[IMU_COUNT] = {0};
 
 /* The char buffer used to show result */
 static char log_buf[LOG_STRING_SIZE];
@@ -95,6 +98,7 @@ static void app_init(void)
         memset(&hipnuc_raw[i], 0, sizeof(hipnuc_raw_t));
         new_data_flag[i] = 0;
         uart_rx_index[i] = 0;
+        packet_ready[i] = 0;
     }
 }
 
@@ -119,29 +123,14 @@ static void printf_welcome_information(void)
  */
 static void process_data(void)
 {
+    // 1. Process received data from each channel
     for (int i = 0; i < IMU_COUNT; i++)
     {
         if (new_data_flag[i])
         {
-            // Disable IRQ briefly to safely read/reset buffer index if needed, 
-            // but since we process what we have, we can just copy and reset.
-            // However, inside the loop we process char by char.
-            // Simpler approach: process the buffer content up to current index.
-            
-            // Note: In a real high-throughput system, double buffering or ring buffer is better.
-            // Here we use the simple logic from the original example: process and reset.
-            
             uint16_t current_len = uart_rx_index[i];
             
-            // To avoid race condition with IRQ adding data while we process,
-            // we could process up to current_len and then shift rest, 
-            // but original example resets index. We'll follow that pattern but be careful.
-            // Ideally: disable IRQ for this UART, copy, reset, enable.
-            
-            /* Simple critical section */
-            // Depending on the UART, we disable its IRQ or global IRQ.
-            // Global is easier but heavy. Let's just process what we have.
-            
+            // Mark processed for this interrupt batch
             new_data_flag[i] = 0; 
             
             // Processing loop
@@ -150,25 +139,11 @@ static void process_data(void)
                 if (hipnuc_input(&hipnuc_raw[i], uart_rx_buf[i][k]))
                 {
                     /* Packet decoded successfully */
-                    
-                    /* Convert result to strings */
-                    hipnuc_dump_packet(&hipnuc_raw[i], log_buf, sizeof(log_buf));
-                    
-                    /* Display result with IMU ID */
-                    printf("[IMU %d] len:%d: %s\r\n", i + 1, hipnuc_raw[i].len, log_buf);
+                    packet_ready[i] = 1;
                 }
             }
             
-            // Reset index. 
-            // WARNING: If IRQ happened during processing, we lose that data if we just set to 0.
-            // Robust way: 
-            // Disable IRQ -> Save index -> Reset index -> Enable IRQ -> Process saved buffer.
-            // But to keep it simple and close to original structure:
-            
-            // Only reset if we processed everything. 
-            // Since we don't have a ring buffer here, we must reset.
-            // We will disable IRQ for this specific UART during reset.
-            
+            // Reset buffer index safely
             IRQn_Type irq_n;
             switch(i) {
                 case 0: irq_n = USART2_IRQn; break;
@@ -182,6 +157,23 @@ static void process_data(void)
             uart_rx_index[i] = 0;
             NVIC_EnableIRQ(irq_n);
         }
+    }
+
+    // 2. Check if all 4 IMUs have valid data ready
+    if (packet_ready[0] && packet_ready[1] && packet_ready[2] && packet_ready[3])
+    {
+        // Print combined data block
+        printf("--- Combined IMU Data ---\r\n");
+        for (int i = 0; i < IMU_COUNT; i++)
+        {
+            // Format packet for this IMU
+            hipnuc_dump_packet(&hipnuc_raw[i], log_buf, sizeof(log_buf));
+            printf("[IMU %d] len:%d: %s\r\n", i + 1, hipnuc_raw[i].len, log_buf);
+            
+            // Clear ready flag
+            packet_ready[i] = 0;
+        }
+        printf("\r\n"); // Extra newline for separation
     }
 }
 
