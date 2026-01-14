@@ -48,10 +48,12 @@
 #define IMU_BAUD    115200
 
 #define IMU_PORT_COUNT        4
-#define UART_RX_BUF_SIZE      2048
-#define LOG_STRING_SIZE       1024
-/* 4 路合并打印的最大长度（按需可调大） */
-#define COMBINED_LOG_SIZE     8192
+/*
+ * 注意：很多 STM32F103（尤其 20KB SRAM 型号/仿真模型）RAM 很紧张。
+ * 这里将缓冲区控制在较小规模，避免静态区把 SRAM 撑爆导致 HardFault。
+ */
+#define UART_RX_BUF_SIZE      512
+#define LOG_STRING_SIZE       512
 /* 单次主循环每路最多处理的字节数，避免单路刷屏导致其他路饥饿 */
 #define MAX_BYTES_PER_LOOP    256
 /* 严格同步窗口：4 路时间戳 max-min 必须 <= 该窗口才允许输出 */
@@ -60,8 +62,8 @@
 #define GROUP_TIMEOUT_US      50000u
 /* 没有成组输出时，周期性打印状态，避免“看起来没数据” */
 #define STATUS_PERIOD_US      1000000u
-/* 每路缓存帧队列深度：提升匹配成功率（RAM 允许可加大） */
-#define FRAME_QUEUE_DEPTH     4u
+/* 每路缓存帧队列深度：提升匹配成功率（RAM 允许可加大，但会占用更多 SRAM） */
+#define FRAME_QUEUE_DEPTH     2u
 /* 允许丢包：成组输出时，允许缺失的 IMU 数量（例如 2 表示至少 2 路有效即可输出） */
 #define MIN_IMU_PER_GROUP     2u
 
@@ -85,7 +87,6 @@ static imu_port_t g_imus[IMU_PORT_COUNT];
 
 /* 打印用缓冲（主循环里串行使用即可） */
 static char log_buf[LOG_STRING_SIZE];
-static char combined_log[COMBINED_LOG_SIZE];
 
 typedef struct
 {
@@ -384,8 +385,6 @@ static int all_queues_nonempty(void)
 
 static void print_combined_group(const imu_frame_t frames[IMU_PORT_COUNT], const uint8_t present[IMU_PORT_COUNT])
 {
-    size_t off = 0;
-
     uint32_t min_ts = 0xFFFFFFFFu, max_ts = 0;
     for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
     {
@@ -401,10 +400,12 @@ static void print_combined_group(const imu_frame_t frames[IMU_PORT_COUNT], const
         max_ts = 0;
     }
 
-    off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
-                            "=== IMU GROUP #%lu dt=%luus ===\r\n",
-                            (unsigned long)g_group_seq,
-                            (unsigned long)(max_ts - min_ts));
+    /*
+     * 为降低 SRAM：不再拼接 8KB 大字符串，而是顺序打印（仍然在主循环里，不会被其他打印穿插）。
+     */
+    printf("=== IMU GROUP #%lu dt=%luus ===\r\n",
+           (unsigned long)g_group_seq,
+           (unsigned long)(max_ts - min_ts));
 
     for (uint8_t imu = 0; imu < IMU_PORT_COUNT; imu++)
     {
@@ -412,30 +413,19 @@ static void print_combined_group(const imu_frame_t frames[IMU_PORT_COUNT], const
         {
             /* 按组打印时再生成字符串 */
             hipnuc_dump_packet((hipnuc_raw_t *)&frames[imu].raw, log_buf, sizeof(log_buf));
-            off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
-                                    "[IMU%u] t=%luus frame_len:%u\r\n%s\r\n",
-                                    (unsigned int)(imu + 1u),
-                                    (unsigned long)frames[imu].ts_us,
-                                    (unsigned int)frames[imu].len,
-                                    log_buf);
+            printf("[IMU%u] t=%luus frame_len:%u\r\n%s\r\n",
+                   (unsigned int)(imu + 1u),
+                   (unsigned long)frames[imu].ts_us,
+                   (unsigned int)frames[imu].len,
+                   log_buf);
         }
         else
         {
-            off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
-                                    "[IMU%u] MISSING\r\n",
-                                    (unsigned int)(imu + 1u));
-        }
-        if (off >= sizeof(combined_log))
-        {
-            off = sizeof(combined_log) - 1u;
-            combined_log[off] = '\0';
-            break;
+            printf("[IMU%u] MISSING\r\n", (unsigned int)(imu + 1u));
         }
     }
 
-    off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off, "\r\n");
-
-    printf("%s", combined_log);
+    printf("\r\n");
 }
 
 static void drop_oldest_head_frame(void)
