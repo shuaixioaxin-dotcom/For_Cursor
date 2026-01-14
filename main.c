@@ -4,6 +4,20 @@
 static void process_data(void)
 {
     static uint16_t wait_timer = 0;
+    static uint32_t frame_count = 0;
+    static uint32_t last_time_ms = 0;
+    static uint32_t current_time_ms = 0;
+    
+    current_time_ms++; // Incremented every ~1ms loop
+    
+    // FPS Calculation (every 1000ms)
+    if (current_time_ms - last_time_ms >= 1000)
+    {
+        printf("[FPS] Output Rate: %d Hz\r\n", frame_count);
+        frame_count = 0;
+        last_time_ms = current_time_ms;
+    }
+
     uint8_t any_new_decoded = 0;
 
     // 1. Process received data from each channel
@@ -90,6 +104,7 @@ static void process_data(void)
                     }
                 }
                 printf("\r\n"); // Extra newline for separation
+                frame_count++;  // Increment FPS counter
             }
             
             // Stop/Reset timer
