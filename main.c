@@ -105,20 +105,22 @@ static inline int rb_pop(ring_buf_t *rb, uint8_t *out)
     return 1;
 }
 
-static inline void imu_uart_irq_handler(uint8_t imu_idx)
+static inline void imu_uart_irq_handler(USART_TypeDef *uart, ring_buf_t *rb)
 {
-    USART_TypeDef *uart = g_imus[imu_idx].uart;
-
     /* RXNE: 收到新字节 */
     if (USART_GetITStatus(uart, USART_IT_RXNE) != RESET)
     {
         uint8_t ch = (uint8_t)USART_ReceiveData(uart);
-        rb_push_isr(&g_imus[imu_idx].rb, ch);
+        rb_push_isr(rb, ch);
     }
 
     /* IDLE: 可用于“帧间隙”提示，本示例不依赖它，但可清除以免反复触发 */
     if (USART_GetITStatus(uart, USART_IT_IDLE) != RESET)
     {
+        /*
+         * 参考手册：清 IDLE 需要先读 SR 再读 DR
+         * (读 DR 也可用 USART_ReceiveData)
+         */
         volatile uint32_t tmp;
         tmp = uart->SR;
         tmp = uart->DR;
@@ -150,13 +152,10 @@ static void app_init(void)
 
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
 
-    /* USART1: debug output; USART2/3/4/5: IMU reception */
-    USART_Configuration(USART1_BAUD, IMU_BAUD);
-
-#if ENABLE_USART_DMA
-    DMA_Configuration();
-#endif
-
+    /*
+     * 重要：4 个 IMU 是自发发送的，可能在上电后立刻产生串口中断。
+     * 因此必须先完成 g_imus[] 的指针/缓冲初始化，再开启各串口中断，避免 ISR 访问未初始化对象导致 HardFault。
+     */
     memset(g_imus, 0, sizeof(g_imus));
     g_imus[0].uart = USART2;
     g_imus[1].uart = USART3;
@@ -170,6 +169,13 @@ static void app_init(void)
         g_imus[i].rb.tail = 0;
         g_imus[i].rb.overflow_cnt = 0;
     }
+
+    /* USART1: debug output; USART2/3/4/5: IMU reception */
+    USART_Configuration(USART1_BAUD, IMU_BAUD);
+
+#if ENABLE_USART_DMA
+    DMA_Configuration();
+#endif
 }
 
 static void printf_welcome_information(void)
@@ -341,21 +347,21 @@ static void DMA_Configuration(void)
 
 void USART2_IRQHandler(void)
 {
-    imu_uart_irq_handler(0);
+    imu_uart_irq_handler(USART2, &g_imus[0].rb);
 }
 
 void USART3_IRQHandler(void)
 {
-    imu_uart_irq_handler(1);
+    imu_uart_irq_handler(USART3, &g_imus[1].rb);
 }
 
 void UART4_IRQHandler(void)
 {
-    imu_uart_irq_handler(2);
+    imu_uart_irq_handler(UART4, &g_imus[2].rb);
 }
 
 void UART5_IRQHandler(void)
 {
-    imu_uart_irq_handler(3);
+    imu_uart_irq_handler(UART5, &g_imus[3].rb);
 }
 
