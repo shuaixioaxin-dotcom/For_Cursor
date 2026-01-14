@@ -7,19 +7,45 @@ def parse_imu_line(line):
     Parse a single line of IMU data.
     Expected format: [IMUx]:q0,q1,q2,q3
     Example: [IMU1]:-0.394,0.645,0.277,0.594
+    Also supports space after colon: [IMU 1]: ...
     """
-    # Regex to match [IMU x]: float, float, float, float
-    # Handling optional spaces and potential negative signs
+    # Relaxed regex:
+    # 1. Match [IMU followed by digits and closing bracket
+    # 2. Match colon, optional space
+    # 3. Match 4 floats separated by commas (allowing optional spaces)
     pattern = r"\[IMU\s*(\d+)\]:\s*([-\d\.]+),\s*([-\d\.]+),\s*([-\d\.]+),\s*([-\d\.]+)"
     match = re.search(pattern, line)
     
     if match:
-        imu_id = int(match.group(1))
-        q0 = float(match.group(2))
-        q1 = float(match.group(3))
-        q2 = float(match.group(4))
-        q3 = float(match.group(5))
-        return imu_id, (q0, q1, q2, q3)
+        try:
+            imu_id = int(match.group(1))
+            q0 = float(match.group(2))
+            q1 = float(match.group(3))
+            q2 = float(match.group(4))
+            q3 = float(match.group(5))
+            return imu_id, (q0, q1, q2, q3)
+        except ValueError:
+            return None
+            
+    # Fallback for user provided format: [IMU1]:-0.394,0.645,0.277,0.594
+    # The previous regex might fail if there are hidden chars or slightly different spacing
+    # Let's try a simpler split approach if regex fails but line looks promising
+    if "[IMU" in line and "]:" in line:
+        try:
+            parts = line.split("]:")
+            if len(parts) == 2:
+                # Parse ID
+                id_part = parts[0].replace("[IMU", "").strip()
+                imu_id = int(id_part)
+                
+                # Parse Data
+                data_part = parts[1].strip()
+                vals = [float(x) for x in data_part.split(',')]
+                if len(vals) == 4:
+                     return imu_id, tuple(vals)
+        except:
+            pass
+            
     return None
 
 def main():
@@ -39,7 +65,13 @@ def main():
             if ser.in_waiting > 0:
                 # Read a line and decode it
                 try:
-                    line = ser.readline().decode('utf-8', errors='ignore').strip()
+                    # Read bytes first to debug encoding issues if any
+                    raw_line = ser.readline()
+                    line = raw_line.decode('utf-8', errors='ignore').strip()
+                    
+                    # Debug: print raw line if empty or strange
+                    # print(f"DEBUG: {line}")
+                    
                 except Exception as e:
                     print(f"Error reading line: {e}")
                     continue
@@ -60,6 +92,11 @@ def main():
                 # Optionally handle FPS or other messages if needed
                 elif "[FPS]" in line:
                     print(f"\033[92m{line}\033[0m") # Print FPS in green if terminal supports it
+                # Fallback: Print unrecognized non-empty lines for debugging
+                else:
+                    # Check if it looks like data but failed regex
+                    if "[IMU" in line:
+                         print(f"Warning: Failed to parse line: {line}")
 
     except serial.SerialException as e:
         print(f"Error opening serial port: {e}")
