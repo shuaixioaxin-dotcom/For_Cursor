@@ -49,6 +49,10 @@
 #define IMU_PORT_COUNT        4
 #define UART_RX_BUF_SIZE      2048
 #define LOG_STRING_SIZE       1024
+/* 4 路合并打印的最大长度（按需可调大） */
+#define COMBINED_LOG_SIZE     8192
+/* 单次主循环每路最多处理的字节数，避免单路刷屏导致其他路饥饿 */
+#define MAX_BYTES_PER_LOOP    256
 
 typedef struct
 {
@@ -70,6 +74,12 @@ static imu_port_t g_imus[IMU_PORT_COUNT];
 
 /* 打印用缓冲（主循环里串行使用即可） */
 static char log_buf[LOG_STRING_SIZE];
+static char combined_log[COMBINED_LOG_SIZE];
+
+/* 每路最新一帧的字符串与长度缓存，用于“4 组合并输出” */
+static char imu_log[IMU_PORT_COUNT][LOG_STRING_SIZE];
+static uint16_t imu_frame_len[IMU_PORT_COUNT];
+static uint8_t imu_updated[IMU_PORT_COUNT];
 
 /* Function prototypes */
 static void USART_Configuration(uint32_t usart1_baud, uint32_t imu_baud);
@@ -170,6 +180,10 @@ static void app_init(void)
         g_imus[i].rb.overflow_cnt = 0;
     }
 
+    memset(imu_log, 0, sizeof(imu_log));
+    memset(imu_frame_len, 0, sizeof(imu_frame_len));
+    memset(imu_updated, 0, sizeof(imu_updated));
+
     /* USART1: debug output; USART2/3/4/5: IMU reception */
     USART_Configuration(USART1_BAUD, IMU_BAUD);
 
@@ -197,26 +211,75 @@ static void printf_welcome_information(void)
     printf("HCLK: %lu Hz\r\n", (unsigned long)RCC_Clocks.HCLK_Frequency);
 }
 
+static int all_imus_updated(void)
+{
+    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
+    {
+        if (!imu_updated[i])
+            return 0;
+    }
+    return 1;
+}
+
+static void clear_imu_updated(void)
+{
+    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
+        imu_updated[i] = 0;
+}
+
+static void print_combined_group(void)
+{
+    size_t off = 0;
+
+    off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
+                            "=== IMU GROUP BEGIN ===\r\n");
+
+    for (uint8_t imu = 0; imu < IMU_PORT_COUNT; imu++)
+    {
+        off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
+                                "[IMU%u] frame_len:%u\r\n%s\r\n",
+                                (unsigned int)(imu + 1u),
+                                (unsigned int)imu_frame_len[imu],
+                                imu_log[imu]);
+        if (off >= sizeof(combined_log))
+        {
+            off = sizeof(combined_log) - 1u;
+            combined_log[off] = '\0';
+            break;
+        }
+    }
+
+    off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
+                            "=== IMU GROUP END ===\r\n\r\n");
+
+    printf("%s", combined_log);
+}
+
 static void process_data(void)
 {
     for (uint8_t imu = 0; imu < IMU_PORT_COUNT; imu++)
     {
         uint8_t ch;
-        while (rb_pop(&g_imus[imu].rb, &ch))
+        uint16_t processed = 0;
+        while (processed < MAX_BYTES_PER_LOOP && rb_pop(&g_imus[imu].rb, &ch))
         {
+            processed++;
             if (hipnuc_input(&g_imus[imu].raw, ch))
             {
                 /* Convert result to string */
                 hipnuc_dump_packet(&g_imus[imu].raw, log_buf, sizeof(log_buf));
 
-                /*
-                 * 关键：一次性 printf，确保 USART1 输出连贯。
-                 * 不在 ISR 打印，避免不同中断/时序导致输出穿插。
-                 */
-                printf("[IMU%u] frame_len:%u\r\n%s\r\n",
-                       (unsigned int)(imu + 1u),
-                       (unsigned int)g_imus[imu].raw.len,
-                       log_buf);
+                /* 缓存“最新一帧”到对应 IMU 槽位 */
+                imu_frame_len[imu] = (uint16_t)g_imus[imu].raw.len;
+                (void)snprintf(imu_log[imu], sizeof(imu_log[imu]), "%s", log_buf);
+                imu_updated[imu] = 1;
+
+                /* 当 4 路都更新后，再合并输出一组 */
+                if (all_imus_updated())
+                {
+                    print_combined_group();
+                    clear_imu_updated();
+                }
             }
         }
     }
