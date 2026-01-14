@@ -62,6 +62,8 @@
 #define STATUS_PERIOD_US      1000000u
 /* 每路缓存帧队列深度：提升匹配成功率（RAM 允许可加大） */
 #define FRAME_QUEUE_DEPTH     4u
+/* 允许丢包：成组输出时，允许缺失的 IMU 数量（例如 2 表示至少 2 路有效即可输出） */
+#define MIN_IMU_PER_GROUP     2u
 
 typedef struct
 {
@@ -109,6 +111,10 @@ static uint32_t g_frame_ok_cnt[IMU_PORT_COUNT];
 static uint32_t g_sync_drop_cnt = 0;
 static uint32_t g_sync_timeout_cnt = 0;
 static uint32_t g_last_timeout_log_us = 0;
+static uint32_t g_soft_time = 0;
+static uint32_t g_loop_cnt = 0;
+static uint8_t g_timebase_ok = 0;
+static uint32_t g_group_ref_us = 0;
 
 /* -------- 时间戳：使用 TIM2 1MHz 自由运行计数（不使用 DWT） -------- */
 static void tim2_timebase_init_1mhz(void)
@@ -139,11 +145,28 @@ static void tim2_timebase_init_1mhz(void)
 
     TIM_SetCounter(TIM2, 0);
     TIM_Cmd(TIM2, ENABLE);
+
+    /* 检测计数器是否在走，避免 timebase 失效导致逻辑“沉默” */
+    {
+        uint32_t a = TIM_GetCounter(TIM2);
+        for (volatile uint32_t i = 0; i < 50000u; i++)
+        {
+            __NOP();
+        }
+        uint32_t b = TIM_GetCounter(TIM2);
+        g_timebase_ok = (a != b) ? 1u : 0u;
+    }
 }
 
 static uint32_t micros_now(void)
 {
-    return (uint32_t)TIM_GetCounter(TIM2);
+    if (g_timebase_ok)
+        return (uint32_t)TIM_GetCounter(TIM2);
+    /*
+     * 退化：无可靠 us 时间源时，用软计数占位，仅用于限频/状态输出不“卡死”。
+     * 注意：这不是精确时间。
+     */
+    return ++g_soft_time;
 }
 
 /* Function prototypes */
@@ -256,6 +279,9 @@ static void app_init(void)
     g_sync_drop_cnt = 0;
     g_sync_timeout_cnt = 0;
     g_last_timeout_log_us = 0;
+    g_soft_time = 0;
+    g_loop_cnt = 0;
+    g_group_ref_us = 0;
 
     /* USART1: debug output; USART2/3/4/5: IMU reception */
     USART_Configuration(USART1_BAUD, IMU_BAUD);
@@ -286,6 +312,7 @@ static void printf_welcome_information(void)
            (unsigned long)SYNC_WINDOW_US,
            (unsigned long)GROUP_TIMEOUT_US);
     printf("Frame queue depth: %lu\r\n", (unsigned long)FRAME_QUEUE_DEPTH);
+    printf("Timebase: TIM2 %s\r\n", g_timebase_ok ? "OK" : "FAIL (fallback)");
 }
 
 static inline uint8_t fq_next(uint8_t v)
@@ -344,15 +371,23 @@ static int all_queues_nonempty(void)
     return 1;
 }
 
-static void print_combined_group(const imu_frame_t frames[IMU_PORT_COUNT])
+static void print_combined_group(const imu_frame_t frames[IMU_PORT_COUNT], const uint8_t present[IMU_PORT_COUNT])
 {
     size_t off = 0;
 
-    uint32_t min_ts = frames[0].ts_us, max_ts = frames[0].ts_us;
-    for (uint8_t i = 1; i < IMU_PORT_COUNT; i++)
+    uint32_t min_ts = 0xFFFFFFFFu, max_ts = 0;
+    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
     {
+        if (!present[i])
+            continue;
         if (frames[i].ts_us < min_ts) min_ts = frames[i].ts_us;
         if (frames[i].ts_us > max_ts) max_ts = frames[i].ts_us;
+    }
+    if (min_ts == 0xFFFFFFFFu)
+    {
+        /* 全缺失不应发生 */
+        min_ts = 0;
+        max_ts = 0;
     }
 
     off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
@@ -362,14 +397,23 @@ static void print_combined_group(const imu_frame_t frames[IMU_PORT_COUNT])
 
     for (uint8_t imu = 0; imu < IMU_PORT_COUNT; imu++)
     {
-        /* 按组打印时再生成字符串，避免每路缓存大量字符串 */
-        hipnuc_dump_packet((hipnuc_raw_t *)&frames[imu].raw, log_buf, sizeof(log_buf));
-        off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
-                                "[IMU%u] t=%luus frame_len:%u\r\n%s\r\n",
-                                (unsigned int)(imu + 1u),
-                                (unsigned long)frames[imu].ts_us,
-                                (unsigned int)frames[imu].len,
-                                log_buf);
+        if (present[imu])
+        {
+            /* 按组打印时再生成字符串 */
+            hipnuc_dump_packet((hipnuc_raw_t *)&frames[imu].raw, log_buf, sizeof(log_buf));
+            off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
+                                    "[IMU%u] t=%luus frame_len:%u\r\n%s\r\n",
+                                    (unsigned int)(imu + 1u),
+                                    (unsigned long)frames[imu].ts_us,
+                                    (unsigned int)frames[imu].len,
+                                    log_buf);
+        }
+        else
+        {
+            off += (size_t)snprintf(combined_log + off, sizeof(combined_log) - off,
+                                    "[IMU%u] MISSING\r\n",
+                                    (unsigned int)(imu + 1u));
+        }
         if (off >= sizeof(combined_log))
         {
             off = sizeof(combined_log) - 1u;
@@ -416,64 +460,104 @@ static void try_emit_groups(void)
 
     uint32_t now = micros_now();
 
-    /* 超时：若存在任何缓存帧太老，则丢弃最旧帧并计数（限频打印） */
-    uint32_t oldest_ts = 0xFFFFFFFFu;
-    uint8_t has_any = 0;
+    /*
+     * 允许丢包的严格窗口分组：
+     * - 以“当前最旧可用帧”的时间戳作为 ref；
+     * - 在每路队列中找一个落在 [ref, ref+SYNC_WINDOW_US] 的帧作为本组成员（找不到则 MISSING）；
+     * - 若本组有效 IMU 数 >= MIN_IMU_PER_GROUP，则输出一组；
+     * - 若 ref 等待超过 GROUP_TIMEOUT_US 仍凑不出最低数量，则丢弃 ref（最旧帧）推进；
+     */
+
+    /* 计算当前 ref（全局最旧队首） */
+    uint32_t ref = 0xFFFFFFFFu;
+    uint8_t any = 0;
     for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
     {
         if (g_fq[i].count == 0u)
             continue;
-        has_any = 1;
+        any = 1;
         uint32_t ts = g_fq[i].q[g_fq[i].head].ts_us;
-        if (ts < oldest_ts)
-            oldest_ts = ts;
+        if (ts < ref)
+            ref = ts;
     }
+    if (!any)
+        return;
 
-    if (has_any && (uint32_t)(now - oldest_ts) > GROUP_TIMEOUT_US)
+    if (g_group_ref_us == 0u)
+        g_group_ref_us = ref;
+
+    /* ref 等太久则推进（并限频提示） */
+    if ((uint32_t)(now - g_group_ref_us) > GROUP_TIMEOUT_US)
     {
         drop_oldest_head_frame();
+        g_group_ref_us = 0u;
         g_sync_timeout_cnt++;
         if ((uint32_t)(now - g_last_timeout_log_us) >= STATUS_PERIOD_US)
         {
             g_last_timeout_log_us = now;
-            printf("[SYNC] timeout drop oldest frame (missing/late IMU frames)\r\n");
+            printf("[SYNC] timeout drop oldest frame (allow loss)\r\n");
+        }
+        return;
+    }
+
+    /* 尝试围绕 ref 组一帧（允许缺失） */
+    imu_frame_t frames[IMU_PORT_COUNT];
+    uint8_t present[IMU_PORT_COUNT] = {0};
+    uint8_t present_cnt = 0;
+
+    for (uint8_t imu = 0; imu < IMU_PORT_COUNT; imu++)
+    {
+        frame_queue_t *fq = &g_fq[imu];
+        if (fq->count == 0u)
+            continue;
+
+        /* 在队列里找第一个落在窗口内的帧 */
+        uint8_t idx = fq->head;
+        for (uint8_t k = 0; k < fq->count; k++)
+        {
+            imu_frame_t *cand = &fq->q[idx];
+            if (cand->ts_us >= ref && (uint32_t)(cand->ts_us - ref) <= SYNC_WINDOW_US)
+            {
+                /* pop 掉窗口前的旧帧（包括选中的） */
+                for (uint8_t popn = 0; popn <= k; popn++)
+                {
+                    imu_frame_t tmp;
+                    (void)fq_pop(imu, &tmp);
+                    if (popn == k)
+                        frames[imu] = tmp;
+                }
+                present[imu] = 1;
+                present_cnt++;
+                break;
+            }
+            idx = fq_next(idx);
         }
     }
 
-    while (all_queues_nonempty())
+    if (present_cnt >= MIN_IMU_PER_GROUP)
     {
-        imu_frame_t heads[IMU_PORT_COUNT];
-        for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
-            (void)fq_peek(i, &heads[i]);
-
-        uint32_t min_ts = heads[0].ts_us, max_ts = heads[0].ts_us;
-        for (uint8_t i = 1; i < IMU_PORT_COUNT; i++)
-        {
-            if (heads[i].ts_us < min_ts) min_ts = heads[i].ts_us;
-            if (heads[i].ts_us > max_ts) max_ts = heads[i].ts_us;
-        }
-
-        if ((max_ts - min_ts) <= SYNC_WINDOW_US)
-        {
-            imu_frame_t frames[IMU_PORT_COUNT];
-            for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
-                (void)fq_pop(i, &frames[i]);
-            print_combined_group(frames);
-            g_group_seq++;
-        }
-        else
-        {
-            drop_oldest_head_frame();
-        }
+        print_combined_group(frames, present);
+        g_group_seq++;
+        g_group_ref_us = 0u;
     }
 }
 
 static void print_status_if_needed(void)
 {
     uint32_t now = micros_now();
-    if ((uint32_t)(now - g_last_status_us) < STATUS_PERIOD_US)
-        return;
-    g_last_status_us = now;
+    g_loop_cnt++;
+    if (g_timebase_ok)
+    {
+        if ((uint32_t)(now - g_last_status_us) < STATUS_PERIOD_US)
+            return;
+        g_last_status_us = now;
+    }
+    else
+    {
+        /* 无可靠时间基准时，每 N 次循环打印一次 */
+        if ((g_loop_cnt % 2000000u) != 0u)
+            return;
+    }
 
     uint8_t miss_mask = 0;
     for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
