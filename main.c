@@ -58,6 +58,8 @@
 #define SYNC_WINDOW_US        3000u
 /* 若一直凑不齐 4 路，超过该超时则丢弃并重新对齐 */
 #define GROUP_TIMEOUT_US      50000u
+/* 没有成组输出时，周期性打印状态，避免“看起来没数据” */
+#define STATUS_PERIOD_US      1000000u
 
 typedef struct
 {
@@ -87,6 +89,10 @@ static uint16_t imu_frame_len[IMU_PORT_COUNT];
 static uint8_t imu_updated[IMU_PORT_COUNT];
 static uint32_t imu_ts_us[IMU_PORT_COUNT];
 static uint32_t g_group_seq = 0;
+static uint32_t g_last_status_us = 0;
+static uint32_t g_frame_ok_cnt[IMU_PORT_COUNT];
+static uint32_t g_sync_drop_cnt = 0;
+static uint32_t g_sync_timeout_cnt = 0;
 
 /* -------- 时间戳：使用 TIM2 1MHz 自由运行计数（不使用 DWT） -------- */
 static void tim2_timebase_init_1mhz(void)
@@ -232,6 +238,10 @@ static void app_init(void)
     memset(imu_updated, 0, sizeof(imu_updated));
     memset(imu_ts_us, 0, sizeof(imu_ts_us));
     g_group_seq = 0;
+    g_last_status_us = 0;
+    memset(g_frame_ok_cnt, 0, sizeof(g_frame_ok_cnt));
+    g_sync_drop_cnt = 0;
+    g_sync_timeout_cnt = 0;
 
     /* USART1: debug output; USART2/3/4/5: IMU reception */
     USART_Configuration(USART1_BAUD, IMU_BAUD);
@@ -329,6 +339,7 @@ static void drop_oldest_frame(void)
         }
     }
     imu_updated[oldest] = 0;
+    g_sync_drop_cnt++;
 }
 
 static void try_emit_group(void)
@@ -349,6 +360,8 @@ static void try_emit_group(void)
         if (imu_updated[i] && (now - imu_ts_us[i] > GROUP_TIMEOUT_US))
         {
             clear_imu_updated();
+            g_sync_timeout_cnt++;
+            printf("[SYNC] timeout resync (missing/late IMU frames)\r\n");
             return;
         }
     }
@@ -375,6 +388,30 @@ static void try_emit_group(void)
     }
 }
 
+static void print_status_if_needed(void)
+{
+    uint32_t now = micros_now();
+    if ((uint32_t)(now - g_last_status_us) < STATUS_PERIOD_US)
+        return;
+    g_last_status_us = now;
+
+    printf("[STAT] ok_cnt: %lu %lu %lu %lu | updated:%u%u%u%u | ovf:%lu %lu %lu %lu | drop:%lu timeout:%lu\r\n",
+           (unsigned long)g_frame_ok_cnt[0],
+           (unsigned long)g_frame_ok_cnt[1],
+           (unsigned long)g_frame_ok_cnt[2],
+           (unsigned long)g_frame_ok_cnt[3],
+           (unsigned int)imu_updated[0],
+           (unsigned int)imu_updated[1],
+           (unsigned int)imu_updated[2],
+           (unsigned int)imu_updated[3],
+           (unsigned long)g_imus[0].rb.overflow_cnt,
+           (unsigned long)g_imus[1].rb.overflow_cnt,
+           (unsigned long)g_imus[2].rb.overflow_cnt,
+           (unsigned long)g_imus[3].rb.overflow_cnt,
+           (unsigned long)g_sync_drop_cnt,
+           (unsigned long)g_sync_timeout_cnt);
+}
+
 static void process_data(void)
 {
     for (uint8_t imu = 0; imu < IMU_PORT_COUNT; imu++)
@@ -388,6 +425,7 @@ static void process_data(void)
             {
                 /* Convert result to string */
                 hipnuc_dump_packet(&g_imus[imu].raw, log_buf, sizeof(log_buf));
+                g_frame_ok_cnt[imu]++;
 
                 /* 缓存“最新一帧”到对应 IMU 槽位 */
                 imu_frame_len[imu] = (uint16_t)g_imus[imu].raw.len;
@@ -400,6 +438,9 @@ static void process_data(void)
             }
         }
     }
+
+    /* 即使没有成组输出，也会周期性打印状态便于定位 */
+    print_status_if_needed();
 }
 
 static void USART_Configuration(uint32_t usart1_baud, uint32_t imu_baud)
