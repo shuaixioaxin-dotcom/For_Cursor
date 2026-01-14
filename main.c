@@ -93,6 +93,8 @@ static uint32_t g_last_status_us = 0;
 static uint32_t g_frame_ok_cnt[IMU_PORT_COUNT];
 static uint32_t g_sync_drop_cnt = 0;
 static uint32_t g_sync_timeout_cnt = 0;
+static uint32_t g_group_start_us = 0;
+static uint32_t g_last_timeout_log_us = 0;
 
 /* -------- 时间戳：使用 TIM2 1MHz 自由运行计数（不使用 DWT） -------- */
 static void tim2_timebase_init_1mhz(void)
@@ -242,6 +244,8 @@ static void app_init(void)
     memset(g_frame_ok_cnt, 0, sizeof(g_frame_ok_cnt));
     g_sync_drop_cnt = 0;
     g_sync_timeout_cnt = 0;
+    g_group_start_us = 0;
+    g_last_timeout_log_us = 0;
 
     /* USART1: debug output; USART2/3/4/5: IMU reception */
     USART_Configuration(USART1_BAUD, IMU_BAUD);
@@ -354,16 +358,23 @@ static void try_emit_group(void)
 
     uint32_t now = micros_now();
 
-    /* 超时：只要有任何已更新帧“等太久”，就整体清掉重来 */
-    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
+    /*
+     * 超时：按“本组开始时间”计时，而不是按某一路帧时间戳计时。
+     * 否则当某一路长期缺失时，会在高帧率输入下频繁触发超时打印刷屏。
+     */
+    if (g_group_start_us != 0u && (uint32_t)(now - g_group_start_us) > GROUP_TIMEOUT_US)
     {
-        if (imu_updated[i] && (now - imu_ts_us[i] > GROUP_TIMEOUT_US))
+        clear_imu_updated();
+        g_group_start_us = 0u;
+        g_sync_timeout_cnt++;
+
+        /* 限频打印：避免刷屏（例如每 1 秒最多打印一次） */
+        if ((uint32_t)(now - g_last_timeout_log_us) >= STATUS_PERIOD_US)
         {
-            clear_imu_updated();
-            g_sync_timeout_cnt++;
+            g_last_timeout_log_us = now;
             printf("[SYNC] timeout resync (missing/late IMU frames)\r\n");
-            return;
         }
+        return;
     }
 
     while (all_imus_updated())
@@ -380,6 +391,7 @@ static void try_emit_group(void)
             print_combined_group();
             g_group_seq++;
             clear_imu_updated();
+            g_group_start_us = 0u;
             return;
         }
 
@@ -395,7 +407,14 @@ static void print_status_if_needed(void)
         return;
     g_last_status_us = now;
 
-    printf("[STAT] ok_cnt: %lu %lu %lu %lu | updated:%u%u%u%u | ovf:%lu %lu %lu %lu | drop:%lu timeout:%lu\r\n",
+    uint8_t miss_mask = 0;
+    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
+    {
+        if (!imu_updated[i])
+            miss_mask |= (uint8_t)(1u << i);
+    }
+
+    printf("[STAT] ok_cnt:%lu %lu %lu %lu | updated:%u%u%u%u | miss_mask:0x%02X | ovf:%lu %lu %lu %lu | drop:%lu timeout:%lu\r\n",
            (unsigned long)g_frame_ok_cnt[0],
            (unsigned long)g_frame_ok_cnt[1],
            (unsigned long)g_frame_ok_cnt[2],
@@ -404,6 +423,7 @@ static void print_status_if_needed(void)
            (unsigned int)imu_updated[1],
            (unsigned int)imu_updated[2],
            (unsigned int)imu_updated[3],
+           (unsigned int)miss_mask,
            (unsigned long)g_imus[0].rb.overflow_cnt,
            (unsigned long)g_imus[1].rb.overflow_cnt,
            (unsigned long)g_imus[2].rb.overflow_cnt,
@@ -432,6 +452,10 @@ static void process_data(void)
                 (void)snprintf(imu_log[imu], sizeof(imu_log[imu]), "%s", log_buf);
                 imu_updated[imu] = 1;
                 imu_ts_us[imu] = micros_now();
+
+                /* 记录本组开始时间（第一帧到达时刻） */
+                if (g_group_start_us == 0u)
+                    g_group_start_us = imu_ts_us[imu];
 
                 /* 每次有新帧进入就尝试凑组（严格窗口对齐） */
                 try_emit_group();
