@@ -33,6 +33,7 @@
 #include "stm32f10x_dma.h"
 #include "stm32f10x_gpio.h"
 #include "stm32f10x_rcc.h"
+#include "stm32f10x_tim.h"
 #include "stm32f10x_usart.h"
 
 #include "hipnuc_dec.h"
@@ -87,32 +88,40 @@ static uint8_t imu_updated[IMU_PORT_COUNT];
 static uint32_t imu_ts_us[IMU_PORT_COUNT];
 static uint32_t g_group_seq = 0;
 
-/* -------- 时间戳：使用 Cortex-M3 DWT_CYCCNT（不依赖 SysTick/delay 实现） -------- */
-static uint8_t dwt_ready = 0;
-
-static void dwt_init(void)
+/* -------- 时间戳：使用 TIM2 1MHz 自由运行计数（不使用 DWT） -------- */
+static void tim2_timebase_init_1mhz(void)
 {
+    RCC_ClocksTypeDef clocks;
+    RCC_GetClocksFreq(&clocks);
+
     /*
-     * Cortex-M3: DWT CYCCNT 可用作高精度时间戳。
-     * 注意：部分量产固件可能关闭 DWT；此处尽量启用，失败则退化为 0 时间戳（同步会退化）。
+     * STM32F1 定时器时钟规则：
+     * - TIM2 在 APB1 上
+     * - 若 PCLK1 分频 = 1，则 TIMxCLK = PCLK1
+     * - 否则 TIMxCLK = 2 * PCLK1
      */
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    dwt_ready = (DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) ? 1u : 0u;
+    uint32_t pclk1 = clocks.PCLK1_Frequency;
+    uint32_t tim2clk = pclk1;
+    if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1)
+        tim2clk = pclk1 * 2u;
+
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
+
+    TIM_TimeBaseInitTypeDef tb;
+    TIM_TimeBaseStructInit(&tb);
+    tb.TIM_CounterMode = TIM_CounterMode_Up;
+    tb.TIM_Period = 0xFFFFFFFFu;
+    tb.TIM_ClockDivision = TIM_CKD_DIV1;
+    tb.TIM_Prescaler = (uint16_t)((tim2clk / 1000000u) - 1u); /* 1MHz -> 1us/计数 */
+    TIM_TimeBaseInit(TIM2, &tb);
+
+    TIM_SetCounter(TIM2, 0);
+    TIM_Cmd(TIM2, ENABLE);
 }
 
 static uint32_t micros_now(void)
 {
-    if (!dwt_ready)
-        return 0;
-
-    /* 基于 SystemCoreClock 转换：us = cycles / (SystemCoreClock/1e6) */
-    uint32_t cycles = DWT->CYCCNT;
-    uint32_t div = (uint32_t)(SystemCoreClock / 1000000u);
-    if (div == 0u)
-        return 0;
-    return cycles / div;
+    return (uint32_t)TIM_GetCounter(TIM2);
 }
 
 /* Function prototypes */
@@ -198,7 +207,7 @@ static void app_init(void)
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
 
     SystemCoreClockUpdate();
-    dwt_init();
+    tim2_timebase_init_1mhz();
 
     /*
      * 重要：4 个 IMU 是自发发送的，可能在上电后立刻产生串口中断。
