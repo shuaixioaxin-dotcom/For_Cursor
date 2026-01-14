@@ -115,6 +115,7 @@ static uint32_t g_soft_time = 0;
 static uint32_t g_loop_cnt = 0;
 static uint8_t g_timebase_ok = 0;
 static uint32_t g_group_ref_us = 0;
+static volatile uint32_t g_rx_byte_cnt[IMU_PORT_COUNT];
 
 /* -------- 时间戳：使用 TIM2 1MHz 自由运行计数（不使用 DWT） -------- */
 static void tim2_timebase_init_1mhz(void)
@@ -210,6 +211,14 @@ static inline void imu_uart_irq_handler(USART_TypeDef *uart, ring_buf_t *rb)
     if (USART_GetITStatus(uart, USART_IT_RXNE) != RESET)
     {
         uint8_t ch = (uint8_t)USART_ReceiveData(uart);
+        /*
+         * 统计收到的原始字节数：用于判断是否“物理层收到了数据但解码失败”
+         * 这里用 uart 指针映射到 index（与 app_init 的分配一致）。
+         */
+        if (uart == USART2) g_rx_byte_cnt[0]++;
+        else if (uart == USART3) g_rx_byte_cnt[1]++;
+        else if (uart == UART4) g_rx_byte_cnt[2]++;
+        else if (uart == UART5) g_rx_byte_cnt[3]++;
         rb_push_isr(rb, ch);
     }
 
@@ -282,6 +291,8 @@ static void app_init(void)
     g_soft_time = 0;
     g_loop_cnt = 0;
     g_group_ref_us = 0;
+    for (uint8_t i = 0; i < IMU_PORT_COUNT; i++)
+        g_rx_byte_cnt[i] = 0;
 
     /* USART1: debug output; USART2/3/4/5: IMU reception */
     USART_Configuration(USART1_BAUD, IMU_BAUD);
@@ -566,7 +577,11 @@ static void print_status_if_needed(void)
             miss_mask |= (uint8_t)(1u << i);
     }
 
-    printf("[STAT] ok_cnt:%lu %lu %lu %lu | q_cnt:%u %u %u %u | miss_mask:0x%02X | ovf:%lu %lu %lu %lu | drop:%lu timeout:%lu\r\n",
+    printf("[STAT] rx_bytes:%lu %lu %lu %lu | ok_cnt:%lu %lu %lu %lu | q_cnt:%u %u %u %u | miss_mask:0x%02X | ovf:%lu %lu %lu %lu | drop:%lu timeout:%lu\r\n",
+           (unsigned long)g_rx_byte_cnt[0],
+           (unsigned long)g_rx_byte_cnt[1],
+           (unsigned long)g_rx_byte_cnt[2],
+           (unsigned long)g_rx_byte_cnt[3],
            (unsigned long)g_frame_ok_cnt[0],
            (unsigned long)g_frame_ok_cnt[1],
            (unsigned long)g_frame_ok_cnt[2],
