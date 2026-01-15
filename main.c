@@ -341,42 +341,54 @@ static void IMU_USART_Configuration(void)
 
 // --- Interrupt Handlers ---
 
+/**
+ * @brief Helper to check suffix match
+ */
+static int check_suffix(const char* buf, int len, const char* suffix)
+{
+    int suffix_len = strlen(suffix);
+    if (len < suffix_len) return 0;
+    return (strncmp(buf + len - suffix_len, suffix, suffix_len) == 0);
+}
+
 void USART1_IRQHandler(void)
 {
     if(USART_GetITStatus(USART1, USART_IT_RXNE) != RESET)
     {
         uint8_t ch = USART_ReceiveData(USART1);
         
-        // Check for newline (Enter key) as command terminator
-        if (ch == '\n' || ch == '\r')
+        // Add to buffer
+        if (usart1_rx_idx < CMD_BUF_SIZE - 1)
         {
-            if (usart1_rx_idx > 0)
-            {
-                usart1_rx_buf[usart1_rx_idx] = '\0'; // Null terminate
-                
-                if (strcmp(usart1_rx_buf, "on") == 0)
-                {
-                    GPIO_SetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN); // Output 3.3V
-                }
-                else if (strcmp(usart1_rx_buf, "off") == 0)
-                {
-                    GPIO_ResetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN); // Output 0V
-                }
-            }
-            // Reset buffer
-            usart1_rx_idx = 0;
+            usart1_rx_buf[usart1_rx_idx++] = (char)ch;
         }
         else
         {
-            if (usart1_rx_idx < CMD_BUF_SIZE - 1)
-            {
-                usart1_rx_buf[usart1_rx_idx++] = (char)ch;
-            }
-            else
-            {
-                // Buffer full, reset to avoid overflow issues or just overwrite
-                usart1_rx_idx = 0;
-            }
+            // Shift buffer left to make space (FIFO behavior for sliding window)
+            memmove(usart1_rx_buf, usart1_rx_buf + 1, CMD_BUF_SIZE - 2);
+            usart1_rx_buf[CMD_BUF_SIZE - 2] = (char)ch;
+            usart1_rx_idx = CMD_BUF_SIZE - 1;
+        }
+        
+        // Ensure null termination for string functions (though we verify length)
+        usart1_rx_buf[usart1_rx_idx] = '\0';
+        
+        // Check commands immediately (no newline required)
+        if (check_suffix(usart1_rx_buf, usart1_rx_idx, "reset"))
+        {
+            NVIC_SystemReset();
+        }
+        else if (check_suffix(usart1_rx_buf, usart1_rx_idx, "on"))
+        {
+            GPIO_SetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN);
+            // Optional: reset buffer to avoid re-triggering if "onon" sent? 
+            // But user wants "direct" trigger.
+            usart1_rx_idx = 0; 
+        }
+        else if (check_suffix(usart1_rx_buf, usart1_rx_idx, "off"))
+        {
+            GPIO_ResetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN);
+            usart1_rx_idx = 0;
         }
     }
 }
