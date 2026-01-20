@@ -1,22 +1,18 @@
 /**
  * @file main.c
- * @brief Serial Port Data Reception Example for 4 IMUs and IO Control
+ * @brief Serial Port Data Reception Example for 2 IMUs and IO Control
  * 
- * This example demonstrates how to receive data from 4 Inertial Measurement Units (IMUs) 
- * using USART2, USART3, UART4, and UART5, and print the decoded results via USART1.
+ * This example demonstrates how to receive data from 2 Inertial Measurement Units (IMUs) 
+ * using USART2 and USART3, and print the decoded results via USART1.
  * Also supports controlling IO pins via USART1 commands ("reset").
  * 
  * @hardware_connections:
  * - USART1 (PA09/PA10): Prints result to the console (Debug) & Receives commands
  * - USART2 (PA02/PA03): IMU 1
  * - USART3 (PB10/PB11): IMU 2
- * - UART4  (PC10/PC11): IMU 3
- * - UART5  (PC12/PD02): IMU 4
  * - IO Control:
  *   - IMU 1 VCC: PA01
  *   - IMU 2 VCC: PA04
- *   - IMU 3 VCC: PA11
- *   - IMU 4 VCC: PA12
  * 
  * @software_configuration:
  * - ENABLE_USART_DMA: Set to 0
@@ -41,7 +37,7 @@
 #define USART1_BAUD 115200
 #define IMU_BAUD    115200
 
-#define IMU_COUNT               4
+#define IMU_COUNT               2
 #define UART_RX_BUF_SIZE        (1024)
 #define LOG_STRING_SIZE         (1024)
 
@@ -50,10 +46,8 @@
 #define CTRL_GPIO_CLK           RCC_APB2Periph_GPIOA
 #define CTRL_GPIO_PIN_1         GPIO_Pin_1
 #define CTRL_GPIO_PIN_2         GPIO_Pin_4
-#define CTRL_GPIO_PIN_3         GPIO_Pin_11
-#define CTRL_GPIO_PIN_4         GPIO_Pin_12
 
-/* IMU stream read/control structs for 4 IMUs */
+/* IMU stream read/control structs for 2 IMUs */
 static hipnuc_raw_t hipnuc_raw[IMU_COUNT];
 
 /* Data arrived flags: 0: no new data, 1: new data */
@@ -65,7 +59,7 @@ static uint8_t packet_ready[IMU_COUNT] = {0};
 /* The char buffer used to show result */
 static char log_buf[LOG_STRING_SIZE];
 
-/* Rx buffers for 4 IMUs */
+/* Rx buffers for 2 IMUs */
 static uint8_t uart_rx_buf[IMU_COUNT][UART_RX_BUF_SIZE];
 static volatile uint16_t uart_rx_index[IMU_COUNT] = {0};
 
@@ -90,6 +84,7 @@ int main(void)
 {
     app_init();
 //    printf_welcome_information();
+    
     while (1)
     {
         process_data();
@@ -106,7 +101,7 @@ static void app_init(void)
     
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
     
-    /* Initialize USART1 for debug output and command input */
+    /* Initialize USART1 for debug output */
     USART1_Configuration();
     
     /* Initialize Control GPIO */
@@ -124,7 +119,7 @@ static void app_init(void)
     }
     
     /* Turn ON all IMUs (Set High) */
-    GPIO_SetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2 | CTRL_GPIO_PIN_3 | CTRL_GPIO_PIN_4);
+    GPIO_SetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2);
 }
 
 /**
@@ -157,8 +152,6 @@ static void process_data(void)
             switch(i) {
                 case 0: irq_n = USART2_IRQn; break;
                 case 1: irq_n = USART3_IRQn; break;
-                case 2: irq_n = UART4_IRQn; break;
-                case 3: irq_n = UART5_IRQn; break;
                 default: irq_n = USART2_IRQn; break;
             }
             
@@ -168,8 +161,8 @@ static void process_data(void)
         }
     }
 
-    // 2. Check if all 4 IMUs have valid data ready
-    if (packet_ready[0] && packet_ready[1] && packet_ready[2] && packet_ready[3])
+    // 2. Check if all 2 IMUs have valid data ready
+    if (packet_ready[0] && packet_ready[1])
     {
         // Print combined data block
 //        printf("---SUM_IUM---\r\n");
@@ -187,7 +180,7 @@ static void process_data(void)
 }
 
 /**
- * @brief Configure USART1 for Debug and Commands
+ * @brief Configure USART1 for Debug
  */
 static void USART1_Configuration(void)
 {
@@ -231,7 +224,7 @@ static void USART1_Configuration(void)
 }
 
 /**
- * @brief Configure Control GPIOs (PA1, PA4, PA5, PA6)
+ * @brief Configure Control GPIOs (PA1, PA4)
  */
 static void Control_GPIO_Configuration(void)
 {
@@ -239,17 +232,17 @@ static void Control_GPIO_Configuration(void)
     
     RCC_APB2PeriphClockCmd(CTRL_GPIO_CLK, ENABLE);
     
-    GPIO_InitStructure.GPIO_Pin = CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2 | CTRL_GPIO_PIN_3 | CTRL_GPIO_PIN_4;
+    GPIO_InitStructure.GPIO_Pin = CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(CTRL_GPIO_PORT, &GPIO_InitStructure);
     
     // Default 0V
-    GPIO_ResetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2 | CTRL_GPIO_PIN_3 | CTRL_GPIO_PIN_4); 
+    GPIO_ResetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2); 
 }
 
 /**
- * @brief Configure USART2, USART3, UART4, UART5
+ * @brief Configure USART2, USART3
  */
 static void IMU_USART_Configuration(void)
 {
@@ -258,10 +251,8 @@ static void IMU_USART_Configuration(void)
     NVIC_InitTypeDef NVIC_InitStructure;
 
     // Enable Clocks
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2 | RCC_APB1Periph_USART3 | 
-                           RCC_APB1Periph_UART4 | RCC_APB1Periph_UART5, ENABLE);
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB | 
-                           RCC_APB2Periph_GPIOC | RCC_APB2Periph_GPIOD, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2 | RCC_APB1Periph_USART3, ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
 
     // Common USART Config
     USART_InitStructure.USART_BaudRate = IMU_BAUD;
@@ -309,44 +300,6 @@ static void IMU_USART_Configuration(void)
 
     NVIC_InitStructure.NVIC_IRQChannel = USART3_IRQn;
     NVIC_Init(&NVIC_InitStructure);
-
-    // --- UART4 (PC10 TX, PC11 RX) ---
-    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_11;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
-    GPIO_Init(GPIOC, &GPIO_InitStructure);
-    
-    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10;
-    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
-    GPIO_Init(GPIOC, &GPIO_InitStructure);
-    
-    USART_Init(UART4, &USART_InitStructure);
-    USART_Cmd(UART4, ENABLE);
-    USART_ITConfig(UART4, USART_IT_RXNE, ENABLE);
-    USART_ITConfig(UART4, USART_IT_IDLE, ENABLE);
-
-    NVIC_InitStructure.NVIC_IRQChannel = UART4_IRQn;
-    NVIC_Init(&NVIC_InitStructure);
-
-    // --- UART5 (PC12 TX, PD2 RX) ---
-    // RX is PD2
-    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
-    GPIO_Init(GPIOD, &GPIO_InitStructure);
-    
-    // TX is PC12
-    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_12;
-    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
-    GPIO_Init(GPIOC, &GPIO_InitStructure);
-    
-    USART_Init(UART5, &USART_InitStructure);
-    USART_Cmd(UART5, ENABLE);
-    USART_ITConfig(UART5, USART_IT_RXNE, ENABLE);
-    USART_ITConfig(UART5, USART_IT_IDLE, ENABLE);
-
-    NVIC_InitStructure.NVIC_IRQChannel = UART5_IRQn;
-    NVIC_Init(&NVIC_InitStructure);
 }
 
 // --- Interrupt Handlers ---
@@ -386,10 +339,10 @@ void USART1_IRQHandler(void)
         // Check commands immediately (no newline required)
         if (check_suffix(usart1_rx_buf, usart1_rx_idx, "reset"))
         {
-            // Reset all 4 IMU VCC pins
-            GPIO_ResetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2 | CTRL_GPIO_PIN_3 | CTRL_GPIO_PIN_4);
+            // Reset all 2 IMU VCC pins
+            GPIO_ResetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2);
             delay_ms(1500);
-            GPIO_SetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2 | CTRL_GPIO_PIN_3 | CTRL_GPIO_PIN_4);
+            GPIO_SetBits(CTRL_GPIO_PORT, CTRL_GPIO_PIN_1 | CTRL_GPIO_PIN_2);
             usart1_rx_idx = 0;
         }
     }
@@ -420,33 +373,5 @@ void USART3_IRQHandler(void)
     if(USART_GetITStatus(USART3, USART_IT_IDLE) != RESET) {
         USART_ReceiveData(USART3); 
         new_data_flag[1] = 1;
-    }
-}
-
-void UART4_IRQHandler(void)
-{
-    if(USART_GetITStatus(UART4, USART_IT_RXNE) != RESET) {
-        uint8_t ch = USART_ReceiveData(UART4);
-        if(uart_rx_index[2] < UART_RX_BUF_SIZE) {
-            uart_rx_buf[2][uart_rx_index[2]++] = ch;
-        }
-    }
-    if(USART_GetITStatus(UART4, USART_IT_IDLE) != RESET) {
-        USART_ReceiveData(UART4); 
-        new_data_flag[2] = 1;
-    }
-}
-
-void UART5_IRQHandler(void)
-{
-    if(USART_GetITStatus(UART5, USART_IT_RXNE) != RESET) {
-        uint8_t ch = USART_ReceiveData(UART5);
-        if(uart_rx_index[3] < UART_RX_BUF_SIZE) {
-            uart_rx_buf[3][uart_rx_index[3]++] = ch;
-        }
-    }
-    if(USART_GetITStatus(UART5, USART_IT_IDLE) != RESET) {
-        USART_ReceiveData(UART5); 
-        new_data_flag[3] = 1;
     }
 }
