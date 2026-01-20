@@ -15,8 +15,8 @@
  * - IO Control:
  *   - IMU 1 VCC: PA01
  *   - IMU 2 VCC: PA04
- *   - IMU 3 VCC: PA05
- *   - IMU 4 VCC: PA06
+ *   - IMU 3 VCC: PA11
+ *   - IMU 4 VCC: PA12
  * 
  * @software_configuration:
  * - ENABLE_USART_DMA: Set to 0
@@ -50,8 +50,8 @@
 #define CTRL_GPIO_CLK           RCC_APB2Periph_GPIOA
 #define CTRL_GPIO_PIN_1         GPIO_Pin_1
 #define CTRL_GPIO_PIN_2         GPIO_Pin_4
-#define CTRL_GPIO_PIN_3         GPIO_Pin_5
-#define CTRL_GPIO_PIN_4         GPIO_Pin_6
+#define CTRL_GPIO_PIN_3         GPIO_Pin_11
+#define CTRL_GPIO_PIN_4         GPIO_Pin_12
 
 /* IMU stream read/control structs for 4 IMUs */
 static hipnuc_raw_t hipnuc_raw[IMU_COUNT];
