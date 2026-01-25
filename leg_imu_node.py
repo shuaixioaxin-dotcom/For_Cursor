@@ -19,15 +19,22 @@ class LegIMUNode(Node):
         self.declare_parameter('frame_id', 'world')
         self.declare_parameter('verbose', True)
         self.declare_parameter('num_imus', 2)
+        self.declare_parameter('read_period', 0.001)
+        self.declare_parameter('log_interval', 3.0)
+        self.declare_parameter('serial_timeout', 0.0)
 
         port = self.get_parameter('port').get_parameter_value().string_value
         baudrate = self.get_parameter('baudrate').get_parameter_value().integer_value
         self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
         self.verbose = self.get_parameter('verbose').get_parameter_value().bool_value
         self.num_imus = self.get_parameter('num_imus').get_parameter_value().integer_value
+        self.read_period = self.get_parameter('read_period').get_parameter_value().double_value
+        self.log_interval = self.get_parameter('log_interval').get_parameter_value().double_value
+        self.serial_timeout = self.get_parameter('serial_timeout').get_parameter_value().double_value
 
         self.get_logger().info(f'Connecting to serial port: {port}, baudrate: {baudrate}')
         self.get_logger().info(f'Number of IMUs: {self.num_imus}')
+        self.get_logger().info(f'Read period: {self.read_period}s, log interval: {self.log_interval}s')
 
         self.imu_publishers = {}
         self.acc_publishers = {}
@@ -53,14 +60,14 @@ class LegIMUNode(Node):
             self.serial = serial.Serial(
                 port=port,
                 baudrate=baudrate,
-                timeout=0.1,
+                timeout=self.serial_timeout,
             )
             self.get_logger().info(f'Successfully opened serial port: {port}')
         except serial.SerialException as e:
             self.get_logger().error(f'Failed to open serial port: {e}')
             raise
 
-        self.timer = self.create_timer(0.001, self.read_serial_data)
+        self.timer = self.create_timer(self.read_period, self.read_serial_data)
 
         self.imu_counters = {i: 0 for i in range(1, self.num_imus + 1)}
         self.acc_counters = {i: 0 for i in range(1, self.num_imus + 1)}
@@ -183,70 +190,80 @@ class LegIMUNode(Node):
 
     def read_serial_data(self):
         try:
-            if self.serial and self.serial.in_waiting:
-                data = self.serial.read(self.serial.in_waiting)
-                ascii_data = data.decode('ascii', errors='ignore')
+            if not (self.serial and self.serial.is_open):
+                return
 
-                lines = self.parse_imu_data(ascii_data)
+            data_chunks = []
+            while True:
+                waiting = self.serial.in_waiting
+                if not waiting:
+                    break
+                data_chunks.append(self.serial.read(waiting))
 
-                for line in lines:
-                    imu_num, quat, accel = self.process_line(line)
-                    if not imu_num:
-                        continue
+            if not data_chunks:
+                return
 
-                    if accel is not None:
-                        acc_msg = self.create_acc_msg(imu_num, accel)
-                        self.acc_publishers[imu_num].publish(acc_msg)
-                        self.acc_counters[imu_num] += 1
-                        if self.verbose:
-                            self.get_logger().debug(
-                                f'IMU{imu_num} acc: '
-                                f'x={accel[0]:.3f}, y={accel[1]:.3f}, z={accel[2]:.3f}'
-                            )
+            ascii_data = b''.join(data_chunks).decode('ascii', errors='ignore')
+            lines = self.parse_imu_data(ascii_data)
 
-                    if quat is not None:
-                        acc_for_imu = self.latest_accels.get(imu_num)
-                        imu_msg = self.create_imu_msg(imu_num, quat, acc_for_imu)
-                        self.imu_publishers[imu_num].publish(imu_msg)
-                        self.imu_counters[imu_num] += 1
-                        if self.verbose:
-                            self.get_logger().debug(
-                                f'IMU{imu_num} quat: '
-                                f'w={quat[0]:.3f}, x={quat[1]:.3f}, '
-                                f'y={quat[2]:.3f}, z={quat[3]:.3f}'
-                            )
+            for line in lines:
+                imu_num, quat, accel = self.process_line(line)
+                if not imu_num:
+                    continue
 
-                current_time = time.time()
-                if current_time - self.last_log_time > 3.0:
-                    self.last_log_time = current_time
-
-                    log_msg = "Publish frequencies (imu/acc): "
-                    for i in range(1, self.num_imus + 1):
-                        imu_freq = self.imu_counters[i] / 3.0
-                        acc_freq = self.acc_counters[i] / 3.0
-                        log_msg += f'IMU{i}: {imu_freq:.1f}Hz/{acc_freq:.1f}Hz '
-                        self.imu_counters[i] = 0
-                        self.acc_counters[i] = 0
-                    self.get_logger().info(log_msg)
-
-                    quat_msg = "Latest quaternions:\n"
-                    for i in range(1, self.num_imus + 1):
-                        q = self.latest_quaternions[i]
-                        quat_msg += (
-                            f'  IMU{i}: '
-                            f'w={q[0]:.3f}, x={q[1]:.3f}, '
-                            f'y={q[2]:.3f}, z={q[3]:.3f}\n'
+                if accel is not None:
+                    acc_msg = self.create_acc_msg(imu_num, accel)
+                    self.acc_publishers[imu_num].publish(acc_msg)
+                    self.acc_counters[imu_num] += 1
+                    if self.verbose:
+                        self.get_logger().debug(
+                            f'IMU{imu_num} acc: '
+                            f'x={accel[0]:.3f}, y={accel[1]:.3f}, z={accel[2]:.3f}'
                         )
-                    self.get_logger().info(quat_msg)
 
-                    acc_msg = "Latest accelerations:\n"
-                    for i in range(1, self.num_imus + 1):
-                        a = self.latest_accels[i]
-                        acc_msg += (
-                            f'  IMU{i}: '
-                            f'x={a[0]:.3f}, y={a[1]:.3f}, z={a[2]:.3f}\n'
+                if quat is not None:
+                    acc_for_imu = self.latest_accels.get(imu_num)
+                    imu_msg = self.create_imu_msg(imu_num, quat, acc_for_imu)
+                    self.imu_publishers[imu_num].publish(imu_msg)
+                    self.imu_counters[imu_num] += 1
+                    if self.verbose:
+                        self.get_logger().debug(
+                            f'IMU{imu_num} quat: '
+                            f'w={quat[0]:.3f}, x={quat[1]:.3f}, '
+                            f'y={quat[2]:.3f}, z={quat[3]:.3f}'
                         )
-                    self.get_logger().info(acc_msg)
+
+            current_time = time.time()
+            if current_time - self.last_log_time > self.log_interval:
+                self.last_log_time = current_time
+
+                log_msg = "Publish frequencies (imu/acc): "
+                for i in range(1, self.num_imus + 1):
+                    imu_freq = self.imu_counters[i] / self.log_interval
+                    acc_freq = self.acc_counters[i] / self.log_interval
+                    log_msg += f'IMU{i}: {imu_freq:.1f}Hz/{acc_freq:.1f}Hz '
+                    self.imu_counters[i] = 0
+                    self.acc_counters[i] = 0
+                self.get_logger().info(log_msg)
+
+                quat_msg = "Latest quaternions:\n"
+                for i in range(1, self.num_imus + 1):
+                    q = self.latest_quaternions[i]
+                    quat_msg += (
+                        f'  IMU{i}: '
+                        f'w={q[0]:.3f}, x={q[1]:.3f}, '
+                        f'y={q[2]:.3f}, z={q[3]:.3f}\n'
+                    )
+                self.get_logger().info(quat_msg)
+
+                acc_msg = "Latest accelerations:\n"
+                for i in range(1, self.num_imus + 1):
+                    a = self.latest_accels[i]
+                    acc_msg += (
+                        f'  IMU{i}: '
+                        f'x={a[0]:.3f}, y={a[1]:.3f}, z={a[2]:.3f}\n'
+                    )
+                self.get_logger().info(acc_msg)
 
         except serial.SerialException as e:
             self.get_logger().error(f'Serial communication error: {e}')
