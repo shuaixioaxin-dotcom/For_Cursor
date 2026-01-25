@@ -49,8 +49,12 @@ class LimbIMUNode(Node):
         self.latest_quaternions = {
             i: [0.0, 0.0, 0.0, 1.0] for i in range(1, self.num_imus + 1)
         }
+        self.latest_accels = {
+            i: [0.0, 0.0, 0.0] for i in range(1, self.num_imus + 1)
+        }
 
         self.buffer = ""
+        self.current_imu = None
 
         # 初始化串口
         try:
@@ -78,26 +82,13 @@ class LimbIMUNode(Node):
         # 添加新数据到缓冲区
         self.buffer += data
 
-        # 查找完整的数据行
         while True:
-            # 查找[IMU开头
-            start = self.buffer.find('[IMU')
-            if start == -1:
-                # 没有IMU数据，清空缓冲区
-                self.buffer = ""
+            newline_index = self.buffer.find('\n')
+            if newline_index == -1:
                 break
 
-            # 查找换行符
-            end = self.buffer.find('\n', start)
-            if end == -1:
-                # 数据不完整，保留在缓冲区中
-                self.buffer = self.buffer[start:]
-                break
-
-            # 提取一行数据
-            line = self.buffer[start:end].strip()
-            self.buffer = self.buffer[end + 1:]
-
+            line = self.buffer[:newline_index].strip()
+            self.buffer = self.buffer[newline_index + 1:]
             if line:
                 lines.append(line)
 
@@ -106,36 +97,65 @@ class LimbIMUNode(Node):
 
         return lines
 
+    def parse_vector(self, data_str, expected_len):
+        tokens = [token.strip() for token in data_str.split(',') if token.strip()]
+        if len(tokens) != expected_len:
+            raise ValueError(f'Expected {expected_len} values, got {len(tokens)}')
+        return [float(token) for token in tokens]
+
+    def process_payload(self, imu_num, payload, line):
+        if payload.startswith('acc:'):
+            data_str = payload[4:].strip()
+            try:
+                accel = self.parse_vector(data_str, 3)
+            except ValueError as e:
+                self.get_logger().warning(f'Failed to parse acc: {e}, line: {line}')
+                return None, None, None
+            self.latest_accels[imu_num] = accel
+            return imu_num, None, accel
+
+        if payload.startswith('quat:'):
+            data_str = payload[5:].strip()
+            try:
+                quat = self.parse_vector(data_str, 4)
+            except ValueError as e:
+                self.get_logger().warning(f'Failed to parse quat: {e}, line: {line}')
+                return None, None, None
+            self.latest_quaternions[imu_num] = quat
+            return imu_num, quat, None
+
+        try:
+            quat = self.parse_vector(payload, 4)
+        except ValueError:
+            return None, None, None
+        self.latest_quaternions[imu_num] = quat
+        return imu_num, quat, None
+
     def process_line(self, line):
         """处理单行IMU数据并发布"""
-        if ']:' in line:
-            parts = line.split(']:', 1)
-            if len(parts) == 2:
-                imu_id = parts[0]
-                data_str = parts[1]
+        if line.startswith('[IMU'):
+            end_bracket = line.find(']')
+            if end_bracket == -1:
+                return None, None, None
+            imu_id = line[4:end_bracket]
+            if not imu_id.isdigit():
+                return None, None, None
+            imu_num = int(imu_id)
+            if not (1 <= imu_num <= self.num_imus):
+                return None, None, None
 
-                # 提取IMU编号
-                if imu_id.startswith('[IMU') and imu_id[4:].isdigit():
-                    imu_num = int(imu_id[4:])
+            self.current_imu = imu_num
+            payload = line[end_bracket + 1:].lstrip(':').strip()
+            if not payload:
+                return None, None, None
+            return self.process_payload(imu_num, payload, line)
 
-                    # 只处理有效的IMU编号
-                    if 1 <= imu_num <= self.num_imus:
-                        # 解析四元数
-                        try:
-                            # 去掉可能的空格并分割
-                            data_str = data_str.strip()
-                            values = [float(x) for x in data_str.split(',')]
-                            if len(values) == 4:
-                                # 存储最新的四元数
-                                self.latest_quaternions[imu_num] = values
-                                return imu_num, values
-                        except ValueError as e:
-                            self.get_logger().warning(
-                                f'Failed to parse IMU data: {e}, line: {line}'
-                            )
-        return None, None
+        if self.current_imu is None:
+            return None, None, None
 
-    def create_imu_msg(self, imu_num, quaternion):
+        return self.process_payload(self.current_imu, line, line)
+
+    def create_imu_msg(self, imu_num, quaternion, accel=None):
         """创建IMU消息"""
         msg = Imu()
 
@@ -159,6 +179,10 @@ class LimbIMUNode(Node):
 
         # 设置线加速度（未知）
         msg.linear_acceleration = Vector3()
+        if accel is not None:
+            msg.linear_acceleration.x = accel[0]
+            msg.linear_acceleration.y = accel[1]
+            msg.linear_acceleration.z = accel[2]
         msg.linear_acceleration_covariance[0] = -1
 
         # 设置方向协方差矩阵（这里设置为未知）
@@ -189,10 +213,20 @@ class LimbIMUNode(Node):
 
             # 处理每一行并发布
             for line in lines:
-                imu_num, quat = self.process_line(line)
-                if imu_num and quat:
+                imu_num, quat, accel = self.process_line(line)
+                if not imu_num:
+                    continue
+
+                if accel is not None and self.verbose:
+                    self.get_logger().debug(
+                        f'IMU{imu_num} acc: '
+                        f'x={accel[0]:.3f}, y={accel[1]:.3f}, z={accel[2]:.3f}'
+                    )
+
+                if quat is not None:
                     # 创建并发布消息
-                    msg = self.create_imu_msg(imu_num, quat)
+                    acc_for_imu = self.latest_accels.get(imu_num)
+                    msg = self.create_imu_msg(imu_num, quat, acc_for_imu)
                     self.publishers_imu_limb[imu_num].publish(msg)
 
                     # 更新计数器
@@ -201,7 +235,7 @@ class LimbIMUNode(Node):
                     # 如果verbose为True，打印每个IMU的四元数
                     if self.verbose:
                         self.get_logger().debug(
-                            f'IMU{imu_num}: '
+                            f'IMU{imu_num} quat: '
                             f'w={quat[0]:.3f}, x={quat[1]:.3f}, '
                             f'y={quat[2]:.3f}, z={quat[3]:.3f}'
                         )
@@ -229,6 +263,15 @@ class LimbIMUNode(Node):
                         f'y={q[2]:.3f}, z={q[3]:.3f}\n'
                     )
                 self.get_logger().info(quat_msg)
+
+                acc_msg = "Latest accelerations:\n"
+                for i in range(1, self.num_imus + 1):
+                    a = self.latest_accels[i]
+                    acc_msg += (
+                        f'  IMU{i}: '
+                        f'x={a[0]:.3f}, y={a[1]:.3f}, z={a[2]:.3f}\n'
+                    )
+                self.get_logger().info(acc_msg)
 
         except serial.SerialException as e:
             self.get_logger().error(f'Serial communication error: {e}')
