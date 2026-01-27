@@ -135,13 +135,13 @@ def read_rtu_frame_from_serial(
         return header + payload
 
 
-def format_values(values: Sequence[float]) -> str:
+def format_values(values: Sequence[float], sig_digits: int = 3) -> str:
     parts = []
     for name, value in zip(("qw", "qx", "qy", "qz"), values):
         if isinstance(value, float) and math.isnan(value):
             parts.append(f"{name}=nan")
         else:
-            parts.append(f"{name}={value}")
+            parts.append(f"{name}={value:.{sig_digits}g}")
     return ", ".join(parts)
 
 
@@ -162,6 +162,7 @@ def main() -> int:
     )
     parser.add_argument("--byteorder", choices=("big", "little"), default="big")
     parser.add_argument("--wordorder", choices=("big", "little"), default="big")
+    parser.add_argument("--sig-digits", type=int, default=3)
     parser.add_argument(
         "--sample",
         action="store_true",
@@ -192,7 +193,7 @@ def main() -> int:
         byteorder=args.byteorder,
         wordorder=args.wordorder,
     )
-    print(format_values(quaternion))
+    print(format_values(quaternion, sig_digits=args.sig_digits))
     return 0
 
 
