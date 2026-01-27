@@ -2,7 +2,7 @@ import argparse
 import math
 import struct
 import unittest
-from typing import Iterable, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -149,8 +149,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Modbus RTU test case for quaternion decoding"
     )
-    parser.add_argument("--port", help="serial port, e.g. /dev/ttyUSB0")
-    parser.add_argument("--baudrate", type=int, default=115200)
+    parser.add_argument(
+        "--port", default="COM35", help="serial port, e.g. COM35 or /dev/ttyUSB0"
+    )
+    parser.add_argument("--baudrate", type=int, default=921600)
     parser.add_argument("--timeout", type=float, default=1.0)
     parser.add_argument("--device-id", type=lambda x: int(x, 0), default=0x02)
     parser.add_argument("--start-addr", type=lambda x: int(x, 0), default=0x0046)
@@ -160,6 +162,11 @@ def main() -> int:
     )
     parser.add_argument("--byteorder", choices=("big", "little"), default="big")
     parser.add_argument("--wordorder", choices=("big", "little"), default="big")
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="use sample response instead of real serial data",
+    )
     args = parser.parse_args()
 
     request = build_read_holding_registers_request(
@@ -167,12 +174,12 @@ def main() -> int:
     )
     print(f"TX: {hex_bytes(request)}")
 
-    if args.port:
+    if args.sample:
+        response = bytes.fromhex("02 03 08 26 FC FF E8 FF C7 02 E8 D0 71")
+    else:
         response = read_rtu_frame_from_serial(
             args.port, args.baudrate, args.timeout, request
         )
-    else:
-        response = bytes.fromhex("02 03 08 26 FC FF E8 FF C7 02 E8 D0 71")
     print(f"RX: {hex_bytes(response)}")
 
     device_id, func_id, data = parse_read_holding_registers_response(response)
