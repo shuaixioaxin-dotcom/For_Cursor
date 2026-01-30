@@ -38,7 +38,7 @@ float actual_hz = 0;
 ModbusRTU mb;
 CRGB leds[NUM_LEDS];
 
-float encoder_angles[NUM_ENCODERS];
+uint16_t encoder_raw_values[NUM_ENCODERS];
 bool encoder_status[NUM_ENCODERS];
 
 unsigned long last_request_time = 0;
@@ -75,6 +75,25 @@ void playStartupSound() {
 
 // ================= 核心：批量处理函数 =================
 
+// 优化：手动整数转字符串（比sprintf快10倍以上）
+char* fast_u16_to_str(char* buf, uint16_t val) {
+    if (val == 0) {
+        *buf++ = '0';
+        return buf;
+    }
+    
+    char tmp[5];
+    int i = 0;
+    while (val > 0) {
+        tmp[i++] = (val % 10) + '0';
+        val /= 10;
+    }
+    while (i > 0) {
+        *buf++ = tmp[--i];
+    }
+    return buf;
+}
+
 // 优化：微秒级超时读取函数
 // response_timeout_us: 等待第一个字节的超时时间 (建议 800us - 1500us)
 // inter_byte_timeout_us: 字节间超时时间 (建议 100us - 200us)
@@ -99,61 +118,68 @@ int readBytesFast(uint8_t *buffer, int length, uint32_t response_timeout_us, uin
     return count;
 }
 
+// 全局标志位，避免在 loop 中重复遍历数组
+bool all_encoders_ok = false;
+
 /**
  * 按照顺序快速完成一轮所有编码器的读取
  * 去掉了异步等待，通过阻塞式读取确保最高频率且不碰撞
  */
 void doBatchProcessing() {
+    bool current_batch_ok = true;
+
     for (int i = 0; i < NUM_ENCODERS; i++) {
-        // 1. 发送请求 - 使用GPIO寄存器直接操作，比digitalWrite快约2-3倍
-        // RS485_DE_RE_PIN=25 < 32，可以直接使用GPIO.out_w1ts/out_w1tc
-        GPIO.out_w1ts = (1UL << RS485_DE_RE_PIN); // 设置为HIGH
+        // 1. 发送请求 - 使用GPIO寄存器直接操作
+        GPIO.out_w1ts = (1UL << RS485_DE_RE_PIN); // HIGH
         Serial2.write(request_frames[i], 8);
         Serial2.flush(); // 确保数据完全发出
-        GPIO.out_w1tc = (1UL << RS485_DE_RE_PIN); // 设置为LOW，立即切换到接收模式
+        GPIO.out_w1tc = (1UL << RS485_DE_RE_PIN); // LOW
 
-        // 2. 等待并读取响应 (Modbus RTU 1寄存器响应为 7 字节)
+        // 2. 等待并读取响应
         uint8_t response[7];
-        // 优化：使用自定义微秒级读取
-        // 响应超时设为 1200us (1.2ms)，字节间超时设为 150us
-        // 2Mbps波特率下，1字节传输约5us。从机响应时间通常在100us-1ms之间。
+        // 响应超时 1200us, 字节间超时 150us
         int len = readBytesFast(response, 7, 1200, 150);
 
         if (len == 7 && response[0] == ENCODER_IDS[i] && response[1] == 0x03) {
-            // 优化：减少浮点运算，使用整数运算
-            uint16_t raw = (response[3] << 8) | response[4];
-            // 360.0/65536.0 ≈ 0.0054931640625，预先计算
-            encoder_angles[i] = raw * 0.0054931640625f;
+            // 优化：仅存储原始值，移除浮点运算
+            // 上位机转换公式: angle = raw * 360.0 / 65536.0
+            encoder_raw_values[i] = (response[3] << 8) | response[4];
             encoder_status[i] = true;
         } else {
             encoder_status[i] = false;
-            // 优化：限制清空次数，避免长时间阻塞
+            current_batch_ok = false;
+            // 优化：快速清空缓冲区
             uint8_t clear_count = 0;
             while(Serial2.available() && clear_count++ < 16) Serial2.read();
         }
     }
 
+    all_encoders_ok = current_batch_ok;
     cycle_count++;
     if (freq_calc_start == 0) freq_calc_start = millis();
 }
 
 // 输出 CSV 格式数据
-// 优化：使用缓冲区一次性输出，减少 Serial.print 调用开销
+// 优化：输出原始整数值（上位机需自行 /65536.0 * 360.0）
+// 使用自定义整数转字符串函数，避免浮点运算和 sprintf 开销
 void outputSimpleCSV() {
-    char buffer[256]; // 足够容纳 16 * 10 字符
-    int pos = 0;
+    char buffer[256]; 
+    char* ptr = buffer;
     
     for (int i = 0; i < NUM_ENCODERS; i++) {
-        // 手动格式化比 sprintf 快，但为了代码简洁这里先用 sprintf
-        pos += sprintf(buffer + pos, "%.2f", encoder_angles[i]);
+        // 获取原始值
+        uint16_t raw = encoder_raw_values[i];
+        
+        ptr = fast_u16_to_str(ptr, raw);
+        
         if (i < NUM_ENCODERS - 1) {
-            buffer[pos++] = ',';
+            *ptr++ = ',';
         }
     }
-    buffer[pos++] = '\r';
-    buffer[pos++] = '\n';
+    *ptr++ = '\r';
+    *ptr++ = '\n';
     
-    Serial.write((const uint8_t*)buffer, pos);
+    Serial.write((const uint8_t*)buffer, ptr - buffer);
 }
 
 // 报告当前频率
@@ -215,14 +241,8 @@ void loop() {
     unsigned long current_time = millis();
     if (current_time - last_led_update_time >= LED_UPDATE_INTERVAL) {
         last_led_update_time = current_time;
-        bool all_ok = true;
-        for (int i = 0; i < NUM_ENCODERS; i++) {
-            if (!encoder_status[i]) {
-                all_ok = false;
-                break; // 找到失败就退出
-            }
-        }
-        leds[0] = all_ok ? CRGB::Green : CRGB::Red;
+        // 优化：直接使用全局标志位，避免循环
+        leds[0] = all_encoders_ok ? CRGB::Green : CRGB::Red;
         FastLED.show();
     }
 
