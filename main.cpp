@@ -20,9 +20,8 @@
 #define BUZZER_PIN 2
 
 // ================= 编码器配置 =================
-#define NUM_ENCODERS 16
-const uint8_t ENCODER_IDS[NUM_ENCODERS] = {1, 2, 3,4, 5,6,7 ,8 ,9 ,10 ,11 ,12, 13, 14 ,15 ,16};
-
+#define NUM_ENCODERS 6
+const uint8_t ENCODER_IDS[NUM_ENCODERS] = {1, 2, 3, 4, 5, 6};
 
 // ================= 批量通讯参数 =================
 // 每个读 1 个寄存器的请求帧长度为 8 字节，响应帧长度为 7 字节
@@ -38,14 +37,17 @@ float actual_hz = 0;
 ModbusRTU mb;
 CRGB leds[NUM_LEDS];
 
+// 使用 uint16_t 存储原始值以提高效率
 uint16_t encoder_raw_values[NUM_ENCODERS];
 bool encoder_status[NUM_ENCODERS];
+// 全局状态标志
+bool all_encoders_ok = false;
 
 unsigned long last_request_time = 0;
 unsigned long last_output_time = 0;
 unsigned long last_freq_report_time = 0;
 unsigned long last_led_update_time = 0;
-const uint32_t LED_UPDATE_INTERVAL = 50; // LED每50ms更新一次，减少开销
+const uint32_t LED_UPDATE_INTERVAL = 50; // LED每50ms更新一次
 
 // ================= CRC16 计算辅助函数 =================
 uint16_t calculateCRC(uint8_t *buf, int len) {
@@ -75,28 +77,9 @@ void playStartupSound() {
 
 // ================= 核心：批量处理函数 =================
 
-// 优化：手动整数转字符串（比sprintf快10倍以上）
-char* fast_u16_to_str(char* buf, uint16_t val) {
-    if (val == 0) {
-        *buf++ = '0';
-        return buf;
-    }
-    
-    char tmp[5];
-    int i = 0;
-    while (val > 0) {
-        tmp[i++] = (val % 10) + '0';
-        val /= 10;
-    }
-    while (i > 0) {
-        *buf++ = tmp[--i];
-    }
-    return buf;
-}
-
 // 优化：微秒级超时读取函数
-// response_timeout_us: 等待第一个字节的超时时间 (建议 800us - 1500us)
-// inter_byte_timeout_us: 字节间超时时间 (建议 100us - 200us)
+// response_timeout_us: 等待第一个字节的超时时间
+// inter_byte_timeout_us: 字节间超时时间
 int readBytesFast(uint8_t *buffer, int length, uint32_t response_timeout_us, uint32_t inter_byte_timeout_us) {
     int count = 0;
     unsigned long start = micros();
@@ -118,9 +101,6 @@ int readBytesFast(uint8_t *buffer, int length, uint32_t response_timeout_us, uin
     return count;
 }
 
-// 全局标志位，避免在 loop 中重复遍历数组
-bool all_encoders_ok = false;
-
 /**
  * 按照顺序快速完成一轮所有编码器的读取
  * 去掉了异步等待，通过阻塞式读取确保最高频率且不碰撞
@@ -135,14 +115,15 @@ void doBatchProcessing() {
         Serial2.flush(); // 确保数据完全发出
         GPIO.out_w1tc = (1UL << RS485_DE_RE_PIN); // LOW
 
-        // 2. 等待并读取响应
+        // 2. 等待并读取响应 (Modbus RTU 1寄存器响应为 7 字节)
         uint8_t response[7];
-        // 响应超时 1200us, 字节间超时 150us
-        int len = readBytesFast(response, 7, 1200, 150);
+        // 优化：使用自定义微秒级读取
+        // 波特率 2.5Mbps -> 1字节约 4us
+        // 响应超时设为 800us，字节间超时设为 100us
+        int len = readBytesFast(response, 7, 800, 100);
 
         if (len == 7 && response[0] == ENCODER_IDS[i] && response[1] == 0x03) {
-            // 优化：仅存储原始值，移除浮点运算
-            // 上位机转换公式: angle = raw * 360.0 / 65536.0
+            // 优化：仅存储原始值，计算推迟到输出阶段
             encoder_raw_values[i] = (response[3] << 8) | response[4];
             encoder_status[i] = true;
         } else {
@@ -159,18 +140,52 @@ void doBatchProcessing() {
     if (freq_calc_start == 0) freq_calc_start = millis();
 }
 
+// 辅助函数：快速将数值转为 "XXX.YY" 格式并追加到 buffer
+// val 应该是 (angle * 100) 的整数形式
+char* fast_angle_to_str(char* buf, uint32_t val) {
+    uint32_t int_part = val / 100;
+    uint32_t dec_part = val % 100;
+    
+    // 整数部分
+    if (int_part == 0) {
+        *buf++ = '0';
+    } else {
+        char tmp[10];
+        int i = 0;
+        while (int_part > 0) {
+            tmp[i++] = (int_part % 10) + '0';
+            int_part /= 10;
+        }
+        while (i > 0) {
+            *buf++ = tmp[--i];
+        }
+    }
+    
+    *buf++ = '.';
+    
+    // 小数部分 (固定2位)
+    *buf++ = (dec_part / 10) + '0';
+    *buf++ = (dec_part % 10) + '0';
+    
+    return buf;
+}
+
 // 输出 CSV 格式数据
-// 优化：输出原始整数值（上位机需自行 /65536.0 * 360.0）
-// 使用自定义整数转字符串函数，避免浮点运算和 sprintf 开销
 void outputSimpleCSV() {
-    char buffer[256]; 
+    char buffer[128]; // 6个编码器数据足够小
     char* ptr = buffer;
     
     for (int i = 0; i < NUM_ENCODERS; i++) {
-        // 获取原始值
         uint16_t raw = encoder_raw_values[i];
         
-        ptr = fast_u16_to_str(ptr, raw);
+        // 使用整数运算计算角度，避免浮点
+        // Angle = raw * 360.0 / 65536.0
+        // Target = Angle * 100 = raw * 36000 / 65536
+        // 36000 / 65536 = 1125 / 2048 (约分)
+        // 2048 是 2^11，可以用位移代替除法
+        uint32_t angle_x100 = ((uint32_t)raw * 1125) >> 11;
+        
+        ptr = fast_angle_to_str(ptr, angle_x100);
         
         if (i < NUM_ENCODERS - 1) {
             *ptr++ = ',';
@@ -195,7 +210,7 @@ void reportFrequency() {
 
 void setup() {
     delay(500);
-    // 提升调试串口波特率到 2000000，减少打印阻塞时间
+    // 提升调试串口波特率到 2000000
     Serial.begin(2000000); 
 
     pinMode(BUZZER_PIN, OUTPUT);
@@ -209,7 +224,7 @@ void setup() {
 
     playStartupSound();
 
-    // 预生成每个编码器的 Modbus 请求帧 [ID] 03 00 01 00 01 [CRC_L] [CRC_H]
+    // 预生成每个编码器的 Modbus 请求帧
     for (int i = 0; i < NUM_ENCODERS; i++) {
         request_frames[i][0] = ENCODER_IDS[i];
         request_frames[i][1] = 0x03;
@@ -222,14 +237,13 @@ void setup() {
         request_frames[i][7] = (crc >> 8) & 0xFF;
     }
 
-    // 初始化串口 2 (2000000)
-    Serial2.begin(2000000, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-    // 优化：减少超时时间
-    Serial2.setTimeout(2);
+    // 初始化 RS485 串口，波特率提升至 2500000
+    Serial2.begin(2500000, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+    Serial2.setRxBufferSize(256); // 稍微增加缓冲区，虽然主要靠实时读取
 
     leds[0] = CRGB::Blue;
     FastLED.show();
-    Serial.println("# System Ready - Fast Batch Mode Enabled (Optimized)");
+    Serial.println("# System Ready - High Freq Batch Mode (2.5Mbps)");
     last_freq_report_time = millis();
 }
 
@@ -237,16 +251,15 @@ void loop() {
     // 1. 执行一轮批量采集
     doBatchProcessing();
 
-    // 2. 定时更新LED状态（降低更新频率以减少开销）
+    // 2. 定时更新LED状态（使用全局标志位）
     unsigned long current_time = millis();
     if (current_time - last_led_update_time >= LED_UPDATE_INTERVAL) {
         last_led_update_time = current_time;
-        // 优化：直接使用全局标志位，避免循环
         leds[0] = all_encoders_ok ? CRGB::Green : CRGB::Red;
         FastLED.show();
     }
 
-    // 3. 定时输出数据 (为了不影响频率，仅在 10ms 间隔后输出一次)
+    // 3. 定时输出数据 (10ms 输出一次，避免串口阻塞影响采集)
     if (current_time - last_output_time >= 10) {
         last_output_time = current_time;
         outputSimpleCSV();
@@ -255,6 +268,6 @@ void loop() {
     // 4. 定时报告实际刷新频率
     if (current_time - last_freq_report_time >= FREQ_REPORT_INTERVAL) {
         last_freq_report_time = current_time;
-        reportFrequency();
+        // reportFrequency(); // 用户要求注释掉
     }
 }
