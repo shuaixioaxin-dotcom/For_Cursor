@@ -38,32 +38,45 @@ pip install -r requirements.txt
 python serial_frequency_test.py --list
 ```
 
-**基本测试：**
+**默认持续高频发送（COM65, 38400 bps）：**
 ```bash
-python serial_frequency_test.py --port /dev/ttyUSB0
-python serial_frequency_test.py --port COM3  # Windows
+python serial_frequency_test.py
+```
+
+**持续高频发送模式：**
+```bash
+python serial_frequency_test.py --continuous
+python serial_frequency_test.py -c
+```
+
+**固定轮数测试：**
+```bash
+python serial_frequency_test.py --rounds 5
+python serial_frequency_test.py --rounds 10 --requests 200
 ```
 
 **自定义参数：**
 ```bash
-# 指定波特率
-python serial_frequency_test.py --port /dev/ttyUSB0 --baudrate 115200
+# 指定其他串口和波特率
+python serial_frequency_test.py --port COM3 --baudrate 115200
 
-# 增加测试轮数和每轮请求数
-python serial_frequency_test.py --port /dev/ttyUSB0 --rounds 10 --requests 200
+# 调整统计打印间隔
+python serial_frequency_test.py --stats-interval 50
 
 # 完整参数
-python serial_frequency_test.py --port /dev/ttyUSB0 --baudrate 9600 --timeout 0.1 --rounds 5 --requests 100 --parity N --stopbits 1
+python serial_frequency_test.py --port COM65 --baudrate 38400 --timeout 0.05 --parity N --stopbits 1
 ```
 
 ### 参数说明
 | 参数 | 简写 | 默认值 | 说明 |
 |------|------|--------|------|
-| --port | -p | - | 串口端口号（必填） |
-| --baudrate | -b | 9600 | 波特率 |
-| --timeout | -t | 0.1 | 读取超时(秒) |
-| --rounds | -r | 5 | 测试轮数 |
+| --port | -p | COM65 | 串口端口号 |
+| --baudrate | -b | 38400 | 波特率 |
+| --timeout | -t | 0.05 | 读取超时(秒) |
+| --rounds | -r | 0 | 测试轮数(0=持续模式) |
 | --requests | -n | 100 | 每轮请求次数 |
+| --continuous | -c | - | 持续高频发送模式 |
+| --stats-interval | -s | 100 | 统计打印间隔 |
 | --parity | - | N | 校验位(N/E/O) |
 | --stopbits | - | 1 | 停止位(1/2) |
 | --list | -l | - | 列出可用串口 |

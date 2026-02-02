@@ -8,8 +8,9 @@
 预期接收：01 03 02 XX XX CRC CRC
 
 用法：
-    python serial_frequency_test.py --port /dev/ttyUSB0 --baudrate 9600
-    python serial_frequency_test.py --port COM3 --baudrate 115200
+    python serial_frequency_test.py                    # 使用默认参数持续发送
+    python serial_frequency_test.py --continuous       # 持续高频发送模式
+    python serial_frequency_test.py --rounds 5         # 固定轮数测试模式
 """
 
 import serial
@@ -18,6 +19,7 @@ import argparse
 import statistics
 from typing import Optional, Tuple, List
 from datetime import datetime
+import sys
 
 
 class SerialFrequencyTester:
@@ -33,8 +35,8 @@ class SerialFrequencyTester:
     def __init__(
         self,
         port: str,
-        baudrate: int = 9600,
-        timeout: float = 0.1,
+        baudrate: int = 38400,
+        timeout: float = 0.05,
         bytesize: int = 8,
         parity: str = "N",
         stopbits: int = 1,
@@ -140,6 +142,127 @@ class SerialFrequencyTester:
             return False
 
         return True
+
+    def run_continuous_test(self, stats_interval: int = 100):
+        """
+        持续高频发送测试（无限循环，直到Ctrl+C中断）
+
+        Args:
+            stats_interval: 每隔多少次请求打印一次统计信息
+        """
+        print("\n" + "#" * 60)
+        print("# 持续高频发送模式")
+        print("#" * 60)
+        print(f"串口: {self.port}")
+        print(f"波特率: {self.baudrate}")
+        print(f"发送帧: {self.REQUEST_FRAME.hex(' ').upper()}")
+        print(f"统计间隔: 每 {stats_interval} 次请求")
+        print("-" * 60)
+        print("按 Ctrl+C 停止测试...")
+        print("-" * 60)
+
+        # 统计变量
+        total_requests = 0
+        total_success = 0
+        total_fail = 0
+        total_invalid = 0
+        response_times: List[float] = []
+        interval_times: List[float] = []
+
+        test_start = time.perf_counter()
+        interval_start = test_start
+        last_response = b""
+
+        try:
+            while True:
+                success, response_time, response = self.send_and_receive()
+                total_requests += 1
+
+                if success:
+                    if self.verify_response(response):
+                        total_success += 1
+                        response_times.append(response_time)
+                        interval_times.append(response_time)
+                        last_response = response
+                    else:
+                        total_invalid += 1
+                else:
+                    total_fail += 1
+
+                # 每隔 stats_interval 次打印统计信息
+                if total_requests % stats_interval == 0:
+                    now = time.perf_counter()
+                    interval_elapsed = (now - interval_start) * 1000  # ms
+                    total_elapsed = (now - test_start)  # seconds
+
+                    # 计算区间统计
+                    if interval_times:
+                        interval_avg = statistics.mean(interval_times)
+                        interval_min = min(interval_times)
+                        interval_max = max(interval_times)
+                        interval_hz = len(interval_times) / (interval_elapsed / 1000) if interval_elapsed > 0 else 0
+                    else:
+                        interval_avg = interval_min = interval_max = 0
+                        interval_hz = 0
+
+                    # 计算总体统计
+                    overall_hz = total_requests / total_elapsed if total_elapsed > 0 else 0
+                    success_rate = (total_success / total_requests * 100) if total_requests > 0 else 0
+
+                    # 打印实时统计
+                    print(
+                        f"[{total_requests:8d}] "
+                        f"成功率: {success_rate:5.1f}% | "
+                        f"响应: {interval_avg:5.2f}ms (min:{interval_min:5.2f} max:{interval_max:5.2f}) | "
+                        f"频率: {interval_hz:6.1f} Hz | "
+                        f"总频率: {overall_hz:6.1f} Hz | "
+                        f"数据: {last_response.hex(' ').upper() if last_response else 'N/A'}"
+                    )
+
+                    # 重置区间统计
+                    interval_times = []
+                    interval_start = now
+
+        except KeyboardInterrupt:
+            pass
+
+        # 打印最终统计
+        test_end = time.perf_counter()
+        total_time = test_end - test_start
+
+        print("\n" + "=" * 60)
+        print("最终统计结果")
+        print("=" * 60)
+        print(f"  总请求数: {total_requests}")
+        print(f"  成功次数: {total_success}")
+        print(f"  失败次数: {total_fail}")
+        print(f"  无效响应: {total_invalid}")
+        print(f"  成功率: {total_success/total_requests*100:.2f}%" if total_requests > 0 else "  成功率: N/A")
+        print("-" * 60)
+        print(f"  总运行时间: {total_time:.2f} 秒")
+        print(f"  平均频率: {total_requests/total_time:.2f} Hz" if total_time > 0 else "  平均频率: N/A")
+
+        if response_times:
+            print("-" * 60)
+            print(f"  最小响应时间: {min(response_times):.2f} ms")
+            print(f"  最大响应时间: {max(response_times):.2f} ms")
+            print(f"  平均响应时间: {statistics.mean(response_times):.2f} ms")
+            if len(response_times) > 1:
+                print(f"  响应时间标准差: {statistics.stdev(response_times):.2f} ms")
+            theoretical_max_hz = 1000 / statistics.mean(response_times)
+            print("-" * 60)
+            print(f"  ★ 理论最高响应频率: {theoretical_max_hz:.2f} Hz")
+
+        print("=" * 60)
+
+        return {
+            "total_requests": total_requests,
+            "total_success": total_success,
+            "total_fail": total_fail,
+            "total_invalid": total_invalid,
+            "total_time": total_time,
+            "response_times": response_times,
+        }
 
     def run_single_test(
         self, num_requests: int, interval_ms: float = 0
@@ -337,20 +460,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python serial_frequency_test.py --port /dev/ttyUSB0
+  python serial_frequency_test.py                          # 默认COM65持续高频发送
+  python serial_frequency_test.py --continuous             # 持续高频发送模式
+  python serial_frequency_test.py --rounds 5               # 固定5轮测试模式
   python serial_frequency_test.py --port COM3 --baudrate 115200
-  python serial_frequency_test.py --port /dev/ttyUSB0 --rounds 10 --requests 200
-  python serial_frequency_test.py --list  # 列出可用串口
+  python serial_frequency_test.py --list                   # 列出可用串口
         """,
     )
 
-    parser.add_argument("--port", "-p", type=str, help="串口端口号 (如 /dev/ttyUSB0 或 COM3)")
-    parser.add_argument("--baudrate", "-b", type=int, default=9600, help="波特率 (默认: 9600)")
-    parser.add_argument("--timeout", "-t", type=float, default=0.1, help="读取超时(秒) (默认: 0.1)")
-    parser.add_argument("--rounds", "-r", type=int, default=5, help="测试轮数 (默认: 5)")
+    parser.add_argument("--port", "-p", type=str, default="COM65", help="串口端口号 (默认: COM65)")
+    parser.add_argument("--baudrate", "-b", type=int, default=38400, help="波特率 (默认: 38400)")
+    parser.add_argument("--timeout", "-t", type=float, default=0.05, help="读取超时(秒) (默认: 0.05)")
+    parser.add_argument("--rounds", "-r", type=int, default=0, help="测试轮数 (默认: 0=持续模式)")
     parser.add_argument("--requests", "-n", type=int, default=100, help="每轮请求次数 (默认: 100)")
     parser.add_argument("--parity", type=str, default="N", choices=["N", "E", "O"], help="校验位 (默认: N)")
     parser.add_argument("--stopbits", type=int, default=1, choices=[1, 2], help="停止位 (默认: 1)")
+    parser.add_argument("--continuous", "-c", action="store_true", help="持续高频发送模式 (默认)")
+    parser.add_argument("--stats-interval", "-s", type=int, default=100, help="统计打印间隔 (默认: 100)")
     parser.add_argument("--list", "-l", action="store_true", help="列出可用串口")
 
     args = parser.parse_args()
@@ -358,13 +484,6 @@ def main():
     # 列出串口
     if args.list:
         list_serial_ports()
-        return
-
-    # 检查端口参数
-    if not args.port:
-        print("错误: 请指定串口端口号 (--port)")
-        print("使用 --list 查看可用串口")
-        parser.print_help()
         return
 
     # 创建测试器
@@ -381,24 +500,46 @@ def main():
         return
 
     try:
-        # 运行测试
-        results = tester.find_max_frequency(
-            test_rounds=args.rounds,
-            requests_per_round=args.requests,
-        )
+        # 判断运行模式
+        if args.rounds > 0 and not args.continuous:
+            # 固定轮数测试模式
+            results = tester.find_max_frequency(
+                test_rounds=args.rounds,
+                requests_per_round=args.requests,
+            )
 
-        # 保存结果到文件
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        result_file = f"serial_test_result_{timestamp}.txt"
-        with open(result_file, "w", encoding="utf-8") as f:
-            f.write(f"串口响应频率测试结果\n")
-            f.write(f"测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"串口: {args.port}\n")
-            f.write(f"波特率: {args.baudrate}\n")
-            f.write(f"总成功率: {results['total_success_rate']*100:.1f}%\n")
-            f.write(f"平均响应时间: {results['overall_avg_response_ms']:.2f} ms\n")
-            f.write(f"理论最高频率: {results['best_hz']:.2f} Hz\n")
-        print(f"\n结果已保存到: {result_file}")
+            # 保存结果到文件
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            result_file = f"serial_test_result_{timestamp}.txt"
+            with open(result_file, "w", encoding="utf-8") as f:
+                f.write(f"串口响应频率测试结果\n")
+                f.write(f"测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"串口: {args.port}\n")
+                f.write(f"波特率: {args.baudrate}\n")
+                f.write(f"总成功率: {results['total_success_rate']*100:.1f}%\n")
+                f.write(f"平均响应时间: {results['overall_avg_response_ms']:.2f} ms\n")
+                f.write(f"理论最高频率: {results['best_hz']:.2f} Hz\n")
+            print(f"\n结果已保存到: {result_file}")
+        else:
+            # 持续高频发送模式（默认）
+            results = tester.run_continuous_test(stats_interval=args.stats_interval)
+
+            # 保存结果到文件
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            result_file = f"serial_test_result_{timestamp}.txt"
+            with open(result_file, "w", encoding="utf-8") as f:
+                f.write(f"串口响应频率测试结果 (持续模式)\n")
+                f.write(f"测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"串口: {args.port}\n")
+                f.write(f"波特率: {args.baudrate}\n")
+                f.write(f"总请求数: {results['total_requests']}\n")
+                f.write(f"成功次数: {results['total_success']}\n")
+                f.write(f"失败次数: {results['total_fail']}\n")
+                f.write(f"总运行时间: {results['total_time']:.2f} 秒\n")
+                if results['response_times']:
+                    f.write(f"平均响应时间: {statistics.mean(results['response_times']):.2f} ms\n")
+                    f.write(f"平均频率: {results['total_requests']/results['total_time']:.2f} Hz\n")
+            print(f"\n结果已保存到: {result_file}")
 
     except KeyboardInterrupt:
         print("\n\n测试被用户中断")
