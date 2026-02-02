@@ -224,14 +224,14 @@ void setup() {
 
     playStartupSound();
 
-    // 预生成每个编码器的 Modbus 请求帧
+    // 预生成每个编码器的 Modbus 请求帧 [ID] 03 00 00 00 01 [CRC_L] [CRC_H]
     for (int i = 0; i < NUM_ENCODERS; i++) {
         request_frames[i][0] = ENCODER_IDS[i];
-        request_frames[i][1] = 0x03;
-        request_frames[i][2] = 0x00;
-        request_frames[i][3] = 0x01; // 地址 1
-        request_frames[i][4] = 0x00;
-        request_frames[i][5] = 0x01; // 读取 1 个寄存器
+        request_frames[i][1] = 0x03; // 功能码 03
+        request_frames[i][2] = 0x00; // 起始地址高
+        request_frames[i][3] = 0x00; // 起始地址低 (通常编码器角度值为 0x0000)
+        request_frames[i][4] = 0x00; // 寄存器数量高
+        request_frames[i][5] = 0x01; // 寄存器数量低 (1个寄存器)
         uint16_t crc = calculateCRC(request_frames[i], 6);
         request_frames[i][6] = crc & 0xFF;
         request_frames[i][7] = (crc >> 8) & 0xFF;
