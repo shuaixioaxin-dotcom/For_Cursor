@@ -115,6 +115,8 @@ def main():
                         help='从站ID列表，支持逗号分隔和范围（默认"1,2"，例如"1,2"或"1-3"或"0x01,0x02"）')
     parser.add_argument('-f', '--freq', type=float, default=0, help='读取频率Hz（0=最高频率）')
     parser.add_argument('-c', '--count', type=int, default=0, help='读取循环次数（0=无限循环，每次循环读取所有从站）')
+    parser.add_argument('-d', '--delay', type=float, default=15, help='从站间延时ms（默认15ms，设为0禁用）')
+    parser.add_argument('-t', '--timeout', type=float, default=20, help='响应超时ms（默认20ms）')
     
     args = parser.parse_args()
     
@@ -128,9 +130,10 @@ def main():
     requests = {slave_id: build_request(slave_id) for slave_id in slave_ids}
     
     slave_ids_str = ','.join([f'0x{sid:02X}' for sid in slave_ids])
-    print(f"串口: {args.port} | 波特率: {args.baudrate} | 从站ID: [{slave_ids_str}] | "
-          f"频率: {'最高' if args.freq == 0 else f'{args.freq}Hz'} | "
-          f"次数: {'无限' if args.count == 0 else args.count}")
+    print(f"串口: {args.port} | 波特率: {args.baudrate} | 从站ID: [{slave_ids_str}]")
+    print(f"频率: {'最高' if args.freq == 0 else f'{args.freq}Hz'} | "
+          f"次数: {'无限' if args.count == 0 else args.count} | "
+          f"从站间延时: {args.delay}ms | 响应超时: {args.timeout}ms")
     print("按 Ctrl+C 退出\n")
     
     try:
@@ -140,10 +143,11 @@ def main():
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=0.01  # 减少超时时间
+            timeout=args.timeout / 1000.0  # 响应超时（转换为秒）
         )
         
         interval = 1.0 / args.freq if args.freq > 0 else 0
+        slave_delay = args.delay / 1000.0  # 从站间延时（转换为秒）
         cycle_count = 0
         
         # 每个从站的统计信息
@@ -182,6 +186,10 @@ def main():
                     else:
                         print(f"[ID:0x{slave_id:02X}] 响应不完整 (收到 {len(response)} 字节)")
                         stats[slave_id]['fail'] += 1
+                    
+                    # 从站间延时，确保总线静默时间
+                    if slave_delay > 0:
+                        time.sleep(slave_delay)
                 
                 cycle_count += 1
                 cycle_time = time.perf_counter() - cycle_start
