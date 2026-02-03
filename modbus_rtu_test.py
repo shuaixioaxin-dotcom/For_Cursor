@@ -6,7 +6,7 @@ import serial
 import struct
 import time
 import argparse
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 # Modbus RTU CRC16查表
 CRC16_TABLE = [
@@ -66,6 +66,70 @@ def build_request(slave_id: int) -> bytes:
     return request_data + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
 
+def verify_crc(data: bytes) -> bool:
+    """验证Modbus RTU帧的CRC"""
+    if len(data) < 3:
+        return False
+    # 数据部分（不含CRC）
+    payload = data[:-2]
+    # 接收到的CRC（小端序）
+    received_crc = data[-2] | (data[-1] << 8)
+    # 计算CRC
+    calculated_crc = crc16_modbus(payload)
+    return received_crc == calculated_crc
+
+
+def read_modbus_response(ser: serial.Serial, expected_slave_id: int, 
+                          expected_len: int, timeout_ms: float) -> Tuple[bytes, str]:
+    """
+    智能读取Modbus响应帧
+    
+    返回: (响应数据, 错误信息)
+    - 成功: (完整帧, "")
+    - 失败: (已读数据, 错误原因)
+    """
+    buffer = bytearray()
+    start_time = time.perf_counter()
+    timeout_sec = timeout_ms / 1000.0
+    
+    while (time.perf_counter() - start_time) < timeout_sec:
+        # 检查可用数据
+        available = ser.in_waiting
+        if available > 0:
+            chunk = ser.read(available)
+            buffer.extend(chunk)
+            
+            # 检查是否收到足够数据
+            if len(buffer) >= expected_len:
+                break
+        else:
+            # 短暂等待，避免CPU空转
+            time.sleep(0.0001)  # 100μs
+    
+    # 数据不足
+    if len(buffer) < expected_len:
+        return bytes(buffer), f"数据不足({len(buffer)}/{expected_len}字节)"
+    
+    # 取前 expected_len 字节作为响应帧
+    response = bytes(buffer[:expected_len])
+    
+    # 验证从站ID
+    if response[0] != expected_slave_id:
+        return response, f"从站ID不匹配(期望0x{expected_slave_id:02X},收到0x{response[0]:02X})"
+    
+    # 验证功能码（0x03 或 异常响应 0x83）
+    if response[1] == 0x83:
+        return response, f"从站异常响应(错误码:0x{response[2]:02X})"
+    if response[1] != 0x03:
+        return response, f"功能码错误(期望0x03,收到0x{response[1]:02X})"
+    
+    # 验证CRC
+    if not verify_crc(response):
+        return response, "CRC校验失败"
+    
+    return response, ""
+
+
 def parse_response(response: bytes) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]]:
     """解析Modbus响应帧，返回加速度和四元数"""
     if len(response) < RESPONSE_LEN:
@@ -115,8 +179,9 @@ def main():
                         help='从站ID列表，支持逗号分隔和范围（默认"1,2"，例如"1,2"或"1-3"或"0x01,0x02"）')
     parser.add_argument('-f', '--freq', type=float, default=0, help='读取频率Hz（0=最高频率）')
     parser.add_argument('-c', '--count', type=int, default=0, help='读取循环次数（0=无限循环，每次循环读取所有从站）')
-    parser.add_argument('-d', '--delay', type=float, default=15, help='从站间延时ms（默认15ms，设为0禁用）')
-    parser.add_argument('-t', '--timeout', type=float, default=20, help='响应超时ms（默认20ms）')
+    parser.add_argument('-d', '--delay', type=float, default=0, help='从站间延时ms（默认0ms，按需设置）')
+    parser.add_argument('-t', '--timeout', type=float, default=5, help='响应超时ms（默认5ms）')
+    parser.add_argument('-v', '--verbose', action='store_true', help='显示详细错误信息和丢弃的数据')
     
     args = parser.parse_args()
     
@@ -143,7 +208,7 @@ def main():
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=args.timeout / 1000.0  # 响应超时（转换为秒）
+            timeout=0  # 非阻塞模式，由 read_modbus_response 控制超时
         )
         
         interval = 1.0 / args.freq if args.freq > 0 else 0
@@ -151,7 +216,14 @@ def main():
         cycle_count = 0
         
         # 每个从站的统计信息
-        stats = {slave_id: {'success': 0, 'fail': 0, 'total_time': 0.0} for slave_id in slave_ids}
+        stats: Dict[int, Dict] = {
+            slave_id: {
+                'success': 0, 
+                'fail': 0, 
+                'total_time': 0.0,
+                'errors': {}  # 错误类型统计
+            } for slave_id in slave_ids
+        }
         total_requests = 0
         
         try:
@@ -162,30 +234,40 @@ def main():
                 for slave_id in slave_ids:
                     request_start = time.perf_counter()
                     
-                    # 清空接收缓冲区
-                    ser.reset_input_buffer()
+                    # 清空接收缓冲区（丢弃残留数据）
+                    if ser.in_waiting > 0:
+                        discarded = ser.read(ser.in_waiting)
+                        if args.verbose:
+                            print(f"[ID:0x{slave_id:02X}] 丢弃残留数据: {discarded.hex()}")
                     
+                    # 发送请求
                     ser.write(requests[slave_id])
                     ser.flush()
-                    response = ser.read(RESPONSE_LEN)
+                    
+                    # 智能读取响应
+                    response, error = read_modbus_response(ser, slave_id, RESPONSE_LEN, args.timeout)
                     
                     request_time = time.perf_counter() - request_start
                     stats[slave_id]['total_time'] += request_time
                     total_requests += 1
                     
-                    if len(response) >= RESPONSE_LEN:
+                    if error:
+                        # 记录错误类型
+                        error_key = error.split('(')[0].strip()
+                        stats[slave_id]['errors'][error_key] = stats[slave_id]['errors'].get(error_key, 0) + 1
+                        stats[slave_id]['fail'] += 1
+                        if args.verbose:
+                            print(f"[ID:0x{slave_id:02X}] 错误: {error} | 原始数据: {response.hex() if response else 'N/A'}")
+                    else:
                         result = parse_response(response)
                         if result:
                             (accx_ms2, accy_ms2, accz_ms2), (qw, qx, qy, qz) = result
                             print(f"[ID:0x{slave_id:02X}] ACC:({accx_ms2:7.3f},{accy_ms2:7.3f},{accz_ms2:7.3f})m/s² | "
-                                  f"QUAT:({qw:6.4f},{qx:6.4f},{qy:6.4f},{qz:6.4f})")
+                                  f"QUAT:({qw:6.4f},{qx:6.4f},{qy:6.4f},{qz:6.4f}) | {request_time*1000:.2f}ms")
                             stats[slave_id]['success'] += 1
                         else:
-                            print(f"[ID:0x{slave_id:02X}] 解析失败")
                             stats[slave_id]['fail'] += 1
-                    else:
-                        print(f"[ID:0x{slave_id:02X}] 响应不完整 (收到 {len(response)} 字节)")
-                        stats[slave_id]['fail'] += 1
+                            stats[slave_id]['errors']['解析失败'] = stats[slave_id]['errors'].get('解析失败', 0) + 1
                     
                     # 从站间延时，确保总线静默时间
                     if slave_delay > 0:
@@ -222,6 +304,11 @@ def main():
                 max_freq = 1000 / avg_time if avg_time > 0 else 0
                 print(f"[ID:0x{slave_id:02X}] 总数={total} 成功={s['success']} 失败={s['fail']} "
                       f"成功率={success_rate:.1f}% 平均耗时={avg_time:.2f}ms 频率={max_freq:.1f}Hz")
+                
+                # 显示错误类型统计
+                if s['errors']:
+                    error_str = ', '.join([f"{k}:{v}" for k, v in s['errors'].items()])
+                    print(f"         错误分布: {error_str}")
         
         print("-" * 80)
         total_all = total_success + total_fail
