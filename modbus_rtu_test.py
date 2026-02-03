@@ -108,18 +108,6 @@ def parse_response(
     )
 
 
-def read_response(ser: serial.Serial, expected_len: int, timeout_s: float) -> bytes:
-    deadline = time.perf_counter() + timeout_s
-    buffer = bytearray()
-    while len(buffer) < expected_len and time.perf_counter() < deadline:
-        chunk = ser.read(expected_len - len(buffer))
-        if chunk:
-            buffer.extend(chunk)
-        else:
-            time.sleep(0.0005)
-    return bytes(buffer)
-
-
 def parse_id_list(value: str) -> List[int]:
     ids = []
     for item in value.split(","):
@@ -166,7 +154,7 @@ def main() -> None:
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=0,
+            timeout=args.timeout,
         )
 
         interval = 1.0 / args.freq if args.freq > 0 else 0
@@ -183,10 +171,9 @@ def main() -> None:
                 cycle_start = time.perf_counter()
 
                 for index, (slave_id, request) in enumerate(zip(ids, requests)):
-                    ser.reset_input_buffer()
                     ser.write(request)
                     ser.flush()
-                    response = read_response(ser, RESPONSE_LEN, args.timeout)
+                    response = ser.read(RESPONSE_LEN)
 
                     result = parse_response(response, slave_id)
                     if result is not None:
