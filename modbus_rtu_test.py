@@ -62,6 +62,13 @@ def crc16_modbus(data: bytes) -> int:
     return crc & 0xFFFF
 
 
+def validate_crc(frame: bytes) -> bool:
+    if len(frame) < 3:
+        return False
+    calc = crc16_modbus(frame[:-2])
+    return frame[-2] == (calc & 0xFF) and frame[-1] == ((calc >> 8) & 0xFF)
+
+
 def build_request(slave_id: int) -> bytes:
     """构建读保持寄存器请求帧（地址/数量固定，仅ID变化）"""
     payload = bytes([
@@ -81,9 +88,13 @@ def parse_response(
     slave_id: int,
 ) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]]:
     """解析Modbus响应帧，返回加速度和四元数"""
-    if len(response) < RESPONSE_LEN:
+    if len(response) != RESPONSE_LEN:
         return None
     if response[0] != slave_id or response[1] != 0x03:
+        return None
+    if response[2] != QUANTITY * 2:
+        return None
+    if not validate_crc(response):
         return None
     accx_raw, accy_raw, accz_raw = struct.unpack_from(">3H", response, 3)
     accx_ms2 = (accx_raw if accx_raw < 32768 else accx_raw - 65536) * ACC_SCALE
@@ -95,6 +106,18 @@ def parse_response(
         (accx_ms2, accy_ms2, accz_ms2),
         (qw * QUAT_SCALE, qx * QUAT_SCALE, qy * QUAT_SCALE, qz * QUAT_SCALE),
     )
+
+
+def read_response(ser: serial.Serial, expected_len: int, timeout_s: float) -> bytes:
+    deadline = time.perf_counter() + timeout_s
+    buffer = bytearray()
+    while len(buffer) < expected_len and time.perf_counter() < deadline:
+        chunk = ser.read(expected_len - len(buffer))
+        if chunk:
+            buffer.extend(chunk)
+        else:
+            time.sleep(0.0005)
+    return bytes(buffer)
 
 
 def parse_id_list(value: str) -> List[int]:
@@ -110,6 +133,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Modbus RTU 批量采集测试工具")
     parser.add_argument("-p", "--port", type=str, default="COM66", help="串口端口（默认COM66）")
     parser.add_argument("-b", "--baudrate", type=int, default=921600, help="波特率（默认921600）")
+    parser.add_argument("-t", "--timeout", type=float, default=0.02, help="单个响应超时秒（默认0.02）")
     parser.add_argument(
         "--ids",
         type=str,
@@ -142,7 +166,7 @@ def main() -> None:
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=0.01,
+            timeout=0,
         )
 
         interval = 1.0 / args.freq if args.freq > 0 else 0
@@ -159,9 +183,10 @@ def main() -> None:
                 cycle_start = time.perf_counter()
 
                 for index, (slave_id, request) in enumerate(zip(ids, requests)):
+                    ser.reset_input_buffer()
                     ser.write(request)
                     ser.flush()
-                    response = ser.read(RESPONSE_LEN)
+                    response = read_response(ser, RESPONSE_LEN, args.timeout)
 
                     result = parse_response(response, slave_id)
                     if result is not None:
