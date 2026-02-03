@@ -181,6 +181,7 @@ def main():
     parser.add_argument('-c', '--count', type=int, default=0, help='读取循环次数（0=无限循环，每次循环读取所有从站）')
     parser.add_argument('-d', '--delay', type=float, default=0, help='从站间延时ms（默认0ms，按需设置）')
     parser.add_argument('-t', '--timeout', type=float, default=5, help='响应超时ms（默认5ms）')
+    parser.add_argument('-w', '--tx-wait', type=float, default=0.5, help='发送后等待ms，让驱动器释放总线（默认0.5ms）')
     parser.add_argument('-v', '--verbose', action='store_true', help='显示详细错误信息和丢弃的数据')
     
     args = parser.parse_args()
@@ -196,9 +197,9 @@ def main():
     
     slave_ids_str = ','.join([f'0x{sid:02X}' for sid in slave_ids])
     print(f"串口: {args.port} | 波特率: {args.baudrate} | 从站ID: [{slave_ids_str}]")
+    print(f"响应超时: {args.timeout}ms | 发送后等待: {args.tx_wait}ms | 从站间延时: {args.delay}ms")
     print(f"频率: {'最高' if args.freq == 0 else f'{args.freq}Hz'} | "
-          f"次数: {'无限' if args.count == 0 else args.count} | "
-          f"从站间延时: {args.delay}ms | 响应超时: {args.timeout}ms")
+          f"次数: {'无限' if args.count == 0 else args.count}")
     print("按 Ctrl+C 退出\n")
     
     try:
@@ -213,6 +214,12 @@ def main():
         
         interval = 1.0 / args.freq if args.freq > 0 else 0
         slave_delay = args.delay / 1000.0  # 从站间延时（转换为秒）
+        tx_wait = args.tx_wait / 1000.0    # 发送后等待时间（转换为秒）
+        
+        # 计算请求帧传输时间 (8字节 * 10位/字节 / 波特率)
+        # 10位 = 1起始位 + 8数据位 + 1停止位
+        tx_time = 8 * 10 / args.baudrate
+        
         cycle_count = 0
         
         # 每个从站的统计信息
@@ -242,7 +249,12 @@ def main():
                     
                     # 发送请求
                     ser.write(requests[slave_id])
-                    ser.flush()
+                    ser.flush()  # 确保数据写入发送缓冲区
+                    
+                    # 等待发送完成 + 驱动器释放总线
+                    # 这对于 RS485 半双工通信非常关键！
+                    if tx_wait > 0:
+                        time.sleep(tx_wait)
                     
                     # 智能读取响应
                     response, error = read_modbus_response(ser, slave_id, RESPONSE_LEN, args.timeout)
