@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Modbus RTU 批量采集测试工具（按编码器处理逻辑）"""
+"""Modbus RTU 批量采集测试工具（多从站轮询）"""
 
 import argparse
+import struct
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import serial
 
@@ -44,7 +45,13 @@ CRC16_TABLE = [
     0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040,
 ]
 
-RESPONSE_LEN = 7  # 读1个寄存器的Modbus RTU响应长度
+# 预计算常量
+ACC_SCALE = 0.0048828  # 加速度转换系数
+QUAT_SCALE = 0.0001    # 四元数转换系数
+QUAT_OFFSET = 41       # 四元数数据偏移（3 + 38）
+START_ADDR = 0x0034
+QUANTITY = 0x0016
+RESPONSE_LEN = 49      # 读0x16个寄存器的响应长度
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -55,28 +62,39 @@ def crc16_modbus(data: bytes) -> int:
     return crc & 0xFFFF
 
 
-def build_request(slave_id: int, start_addr: int, quantity: int) -> bytes:
-    """构建读保持寄存器请求帧"""
+def build_request(slave_id: int) -> bytes:
+    """构建读保持寄存器请求帧（地址/数量固定，仅ID变化）"""
     payload = bytes([
         slave_id,
         0x03,
-        (start_addr >> 8) & 0xFF,
-        start_addr & 0xFF,
-        (quantity >> 8) & 0xFF,
-        quantity & 0xFF,
+        (START_ADDR >> 8) & 0xFF,
+        START_ADDR & 0xFF,
+        (QUANTITY >> 8) & 0xFF,
+        QUANTITY & 0xFF,
     ])
     crc = crc16_modbus(payload)
     return payload + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
 
-def parse_response(response: bytes, slave_id: int) -> Optional[float]:
-    """按编码器逻辑解析响应帧，返回角度(度)"""
-    if len(response) != RESPONSE_LEN:
+def parse_response(
+    response: bytes,
+    slave_id: int,
+) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]]:
+    """解析Modbus响应帧，返回加速度和四元数"""
+    if len(response) < RESPONSE_LEN:
         return None
     if response[0] != slave_id or response[1] != 0x03:
         return None
-    raw = (response[3] << 8) | response[4]
-    return (raw * 360.0) / 65536.0
+    accx_raw, accy_raw, accz_raw = struct.unpack_from(">3H", response, 3)
+    accx_ms2 = (accx_raw if accx_raw < 32768 else accx_raw - 65536) * ACC_SCALE
+    accy_ms2 = (accy_raw if accy_raw < 32768 else accy_raw - 65536) * ACC_SCALE
+    accz_ms2 = (accz_raw if accz_raw < 32768 else accz_raw - 65536) * ACC_SCALE
+
+    qw, qx, qy, qz = struct.unpack_from(">4h", response, QUAT_OFFSET)
+    return (
+        (accx_ms2, accy_ms2, accz_ms2),
+        (qw * QUAT_SCALE, qx * QUAT_SCALE, qy * QUAT_SCALE, qz * QUAT_SCALE),
+    )
 
 
 def parse_id_list(value: str) -> List[int]:
@@ -92,27 +110,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Modbus RTU 批量采集测试工具")
     parser.add_argument("-p", "--port", type=str, default="COM66", help="串口端口（默认COM66）")
     parser.add_argument("-b", "--baudrate", type=int, default=921600, help="波特率（默认921600）")
-    parser.add_argument("-i", "--id", type=int, default=2, help="从站ID（默认2）")
-    parser.add_argument("--ids", type=str, default="", help="多个从站ID，逗号分隔，如: 1,2,3")
-    parser.add_argument("-a", "--addr", type=lambda x: int(x, 0), default=0x0000, help="寄存器起始地址（默认0x0000）")
-    parser.add_argument("-q", "--quantity", type=int, default=1, help="读取寄存器数量（默认1）")
+    parser.add_argument(
+        "--ids",
+        type=str,
+        default="0x01,0x02",
+        help="多个从站ID，逗号分隔，如: 0x01,0x02",
+    )
     parser.add_argument("-f", "--freq", type=float, default=0, help="循环频率Hz（0=最高频率）")
     parser.add_argument("-c", "--count", type=int, default=0, help="循环次数（0=无限循环）")
 
     args = parser.parse_args()
 
-    if args.quantity != 1:
-        raise ValueError("当前逻辑仅支持读取1个寄存器，请设置 --quantity=1")
-
-    ids = parse_id_list(args.ids) if args.ids else [args.id]
+    ids = parse_id_list(args.ids)
     if not ids:
         raise ValueError("从站ID列表为空")
 
-    requests = [build_request(slave_id, args.addr, args.quantity) for slave_id in ids]
+    requests = [build_request(slave_id) for slave_id in ids]
 
     print(
         f"串口: {args.port} | 波特率: {args.baudrate} | 从站ID: {ids} | "
-        f"寄存器: 0x{args.addr:04X} | 频率: {'最高' if args.freq == 0 else f'{args.freq}Hz'} | "
+        f"寄存器: 0x{START_ADDR:04X} 数量: {QUANTITY} | "
+        f"频率: {'最高' if args.freq == 0 else f'{args.freq}Hz'} | "
         f"次数: {'无限' if args.count == 0 else args.count}"
     )
     print("按 Ctrl+C 退出\n")
@@ -132,8 +150,9 @@ def main() -> None:
         success_count = 0
         fail_count = 0
         total_time = 0.0
-        encoder_angles = [0.0 for _ in ids]
-        encoder_status = [False for _ in ids]
+        acc_values = [(0.0, 0.0, 0.0) for _ in ids]
+        quat_values = [(0.0, 0.0, 0.0, 0.0) for _ in ids]
+        sensor_status = [False for _ in ids]
 
         try:
             while args.count == 0 or cycle_count < args.count:
@@ -144,13 +163,13 @@ def main() -> None:
                     ser.flush()
                     response = ser.read(RESPONSE_LEN)
 
-                    angle = parse_response(response, slave_id)
-                    if angle is not None:
-                        encoder_angles[index] = angle
-                        encoder_status[index] = True
+                    result = parse_response(response, slave_id)
+                    if result is not None:
+                        acc_values[index], quat_values[index] = result
+                        sensor_status[index] = True
                         success_count += 1
                     else:
-                        encoder_status[index] = False
+                        sensor_status[index] = False
                         fail_count += 1
                         if ser.in_waiting:
                             ser.read(ser.in_waiting)
@@ -159,11 +178,17 @@ def main() -> None:
                 cycle_time = time.perf_counter() - cycle_start
                 total_time += cycle_time
 
-                all_ok = all(encoder_status)
+                all_ok = all(sensor_status)
                 status_parts = []
                 for idx, slave_id in enumerate(ids):
-                    if encoder_status[idx]:
-                        status_parts.append(f"ID{slave_id}: {encoder_angles[idx]:7.3f}°")
+                    if sensor_status[idx]:
+                        accx_ms2, accy_ms2, accz_ms2 = acc_values[idx]
+                        qw, qx, qy, qz = quat_values[idx]
+                        status_parts.append(
+                            f"ID{slave_id} "
+                            f"ACC:({accx_ms2:7.3f},{accy_ms2:7.3f},{accz_ms2:7.3f})m/s² "
+                            f"QUAT:({qw:6.4f},{qx:6.4f},{qy:6.4f},{qz:6.4f})"
+                        )
                     else:
                         status_parts.append(f"ID{slave_id}: FAIL")
                 status_line = " | ".join(status_parts)
