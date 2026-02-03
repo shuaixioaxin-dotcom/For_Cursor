@@ -1,0 +1,198 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""Modbus RTU 批量采集测试工具（按编码器处理逻辑）"""
+
+import argparse
+import time
+from typing import List, Optional
+
+import serial
+
+# Modbus RTU CRC16查表
+CRC16_TABLE = [
+    0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
+    0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
+    0xCC01, 0x0CC0, 0x0D80, 0xCD41, 0x0F00, 0xCFC1, 0xCE81, 0x0E40,
+    0x0A00, 0xCAC1, 0xCB81, 0x0B40, 0xC901, 0x09C0, 0x0880, 0xC841,
+    0xD801, 0x18C0, 0x1980, 0xD941, 0x1B00, 0xDBC1, 0xDA81, 0x1A40,
+    0x1E00, 0xDEC1, 0xDF81, 0x1F40, 0xDD01, 0x1DC0, 0x1C80, 0xDC41,
+    0x1400, 0xD4C1, 0xD581, 0x1540, 0xD701, 0x17C0, 0x1680, 0xD641,
+    0xD201, 0x12C0, 0x1380, 0xD341, 0x1100, 0xD1C1, 0xD081, 0x1040,
+    0xF001, 0x30C0, 0x3180, 0xF141, 0x3300, 0xF3C1, 0xF281, 0x3240,
+    0x3600, 0xF6C1, 0xF781, 0x3740, 0xF501, 0x35C0, 0x3480, 0xF441,
+    0x3C00, 0xFCC1, 0xFD81, 0x3D40, 0xFF01, 0x3FC0, 0x3E80, 0xFE41,
+    0xFA01, 0x3AC0, 0x3B80, 0xFB41, 0x3900, 0xF9C1, 0xF881, 0x3840,
+    0x2800, 0xE8C1, 0xE981, 0x2940, 0xEB01, 0x2BC0, 0x2A80, 0xEA41,
+    0xEE01, 0x2EC0, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
+    0xE401, 0x24C0, 0x2580, 0xE541, 0x2700, 0xE7C1, 0xE681, 0x2640,
+    0x2200, 0xE2C1, 0xE381, 0x2340, 0xE101, 0x21C0, 0x2080, 0xE041,
+    0xA001, 0x60C0, 0x6180, 0xA141, 0x6300, 0xA3C1, 0xA281, 0x6240,
+    0x6600, 0xA6C1, 0xA781, 0x6740, 0xA501, 0x65C0, 0x6480, 0xA441,
+    0x6C00, 0xACC1, 0xAD81, 0x6D40, 0xAF01, 0x6FC0, 0x6E80, 0xAE41,
+    0xAA01, 0x6AC0, 0x6B80, 0xAB41, 0x6900, 0xA9C1, 0xA881, 0x6840,
+    0x7800, 0xB8C1, 0xB981, 0x7940, 0xBB01, 0x7BC0, 0x7A80, 0xBA41,
+    0xBE01, 0x7EC0, 0x7F80, 0xBF41, 0x7D00, 0xBDC1, 0xBC81, 0x7C40,
+    0xB401, 0x74C0, 0x7580, 0xB541, 0x7700, 0xB7C1, 0xB681, 0x7640,
+    0x7200, 0xB2C1, 0xB381, 0x7340, 0xB101, 0x71C0, 0x7080, 0xB041,
+    0x5000, 0x90C1, 0x9181, 0x5140, 0x9301, 0x53C0, 0x5280, 0x9241,
+    0x9601, 0x56C0, 0x5780, 0x9741, 0x5500, 0x95C1, 0x9481, 0x5440,
+    0x9C01, 0x5CC0, 0x5D80, 0x9D41, 0x5F00, 0x9FC1, 0x9E81, 0x5E40,
+    0x5A00, 0x9AC1, 0x9B81, 0x5B40, 0x9901, 0x59C0, 0x5880, 0x9841,
+    0x8801, 0x48C0, 0x4980, 0x8941, 0x4B00, 0x8BC1, 0x8A81, 0x4A40,
+    0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41,
+    0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680, 0x8641,
+    0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040,
+]
+
+RESPONSE_LEN = 7  # 读1个寄存器的Modbus RTU响应长度
+
+
+def crc16_modbus(data: bytes) -> int:
+    """计算Modbus RTU CRC16校验值"""
+    crc = 0xFFFF
+    for byte in data:
+        crc = (crc >> 8) ^ CRC16_TABLE[(crc ^ byte) & 0xFF]
+    return crc & 0xFFFF
+
+
+def build_request(slave_id: int, start_addr: int, quantity: int) -> bytes:
+    """构建读保持寄存器请求帧"""
+    payload = bytes([
+        slave_id,
+        0x03,
+        (start_addr >> 8) & 0xFF,
+        start_addr & 0xFF,
+        (quantity >> 8) & 0xFF,
+        quantity & 0xFF,
+    ])
+    crc = crc16_modbus(payload)
+    return payload + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+
+def parse_response(response: bytes, slave_id: int) -> Optional[float]:
+    """按编码器逻辑解析响应帧，返回角度(度)"""
+    if len(response) != RESPONSE_LEN:
+        return None
+    if response[0] != slave_id or response[1] != 0x03:
+        return None
+    raw = (response[3] << 8) | response[4]
+    return (raw * 360.0) / 65536.0
+
+
+def parse_id_list(value: str) -> List[int]:
+    ids = []
+    for item in value.split(","):
+        item = item.strip()
+        if item:
+            ids.append(int(item, 0))
+    return ids
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Modbus RTU 批量采集测试工具")
+    parser.add_argument("-p", "--port", type=str, default="COM66", help="串口端口（默认COM66）")
+    parser.add_argument("-b", "--baudrate", type=int, default=921600, help="波特率（默认921600）")
+    parser.add_argument("-i", "--id", type=int, default=2, help="从站ID（默认2）")
+    parser.add_argument("--ids", type=str, default="", help="多个从站ID，逗号分隔，如: 1,2,3")
+    parser.add_argument("-a", "--addr", type=lambda x: int(x, 0), default=0x0000, help="寄存器起始地址（默认0x0000）")
+    parser.add_argument("-q", "--quantity", type=int, default=1, help="读取寄存器数量（默认1）")
+    parser.add_argument("-f", "--freq", type=float, default=0, help="循环频率Hz（0=最高频率）")
+    parser.add_argument("-c", "--count", type=int, default=0, help="循环次数（0=无限循环）")
+
+    args = parser.parse_args()
+
+    if args.quantity != 1:
+        raise ValueError("当前逻辑仅支持读取1个寄存器，请设置 --quantity=1")
+
+    ids = parse_id_list(args.ids) if args.ids else [args.id]
+    if not ids:
+        raise ValueError("从站ID列表为空")
+
+    requests = [build_request(slave_id, args.addr, args.quantity) for slave_id in ids]
+
+    print(
+        f"串口: {args.port} | 波特率: {args.baudrate} | 从站ID: {ids} | "
+        f"寄存器: 0x{args.addr:04X} | 频率: {'最高' if args.freq == 0 else f'{args.freq}Hz'} | "
+        f"次数: {'无限' if args.count == 0 else args.count}"
+    )
+    print("按 Ctrl+C 退出\n")
+
+    try:
+        ser = serial.Serial(
+            port=args.port,
+            baudrate=args.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.01,
+        )
+
+        interval = 1.0 / args.freq if args.freq > 0 else 0
+        cycle_count = 0
+        success_count = 0
+        fail_count = 0
+        total_time = 0.0
+        encoder_angles = [0.0 for _ in ids]
+        encoder_status = [False for _ in ids]
+
+        try:
+            while args.count == 0 or cycle_count < args.count:
+                cycle_start = time.perf_counter()
+
+                for index, (slave_id, request) in enumerate(zip(ids, requests)):
+                    ser.write(request)
+                    ser.flush()
+                    response = ser.read(RESPONSE_LEN)
+
+                    angle = parse_response(response, slave_id)
+                    if angle is not None:
+                        encoder_angles[index] = angle
+                        encoder_status[index] = True
+                        success_count += 1
+                    else:
+                        encoder_status[index] = False
+                        fail_count += 1
+                        if ser.in_waiting:
+                            ser.read(ser.in_waiting)
+
+                cycle_count += 1
+                cycle_time = time.perf_counter() - cycle_start
+                total_time += cycle_time
+
+                all_ok = all(encoder_status)
+                status_parts = []
+                for idx, slave_id in enumerate(ids):
+                    if encoder_status[idx]:
+                        status_parts.append(f"ID{slave_id}: {encoder_angles[idx]:7.3f}°")
+                    else:
+                        status_parts.append(f"ID{slave_id}: FAIL")
+                status_line = " | ".join(status_parts)
+                print(f"{'OK' if all_ok else 'ERR'} | {status_line}")
+
+                if args.freq > 0:
+                    sleep_time = interval - cycle_time
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+
+        except KeyboardInterrupt:
+            pass
+
+        if cycle_count > 0:
+            avg_time = (total_time / cycle_count) * 1000
+            max_freq = 1000 / avg_time if avg_time > 0 else 0
+            total_responses = cycle_count * len(ids)
+            success_rate = (success_count / total_responses * 100) if total_responses > 0 else 0
+            print(
+                f"\n统计: 循环={cycle_count} 响应总数={total_responses} "
+                f"成功={success_count} 失败={fail_count} "
+                f"成功率={success_rate:.1f}% 平均周期={avg_time:.2f}ms 实际频率={max_freq:.1f}Hz"
+            )
+
+        ser.close()
+
+    except Exception as exc:
+        print(f"错误: {exc}")
+
+
+if __name__ == "__main__":
+    main()
