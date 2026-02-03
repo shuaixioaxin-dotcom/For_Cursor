@@ -125,7 +125,11 @@ def main() -> None:
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
             timeout=args.timeout,
+            rtscts=False,
+            dsrdtr=False,
         )
+        ser.rts = False
+        ser.dtr = False
 
         interval = 1.0 / args.freq if args.freq > 0 else 0
         cycle_count = 0
