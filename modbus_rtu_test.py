@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Modbus RTU 帧解析测试工具 - 多从站循环读取版本"""
+"""Modbus RTU 帧解析测试工具 - 多从站批处理版本"""
 
 import serial
 import struct
 import time
 import argparse
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 # Modbus RTU CRC16查表
 CRC16_TABLE = [
@@ -86,13 +86,34 @@ def parse_response(response: bytes) -> Optional[Tuple[Tuple[float, float, float]
     return ((accx_ms2, accy_ms2, accz_ms2), (qw * QUAT_SCALE, qx * QUAT_SCALE, qy * QUAT_SCALE, qz * QUAT_SCALE))
 
 
+def extract_frames(data: bytes, slave_ids: List[int]) -> Dict[int, bytes]:
+    """从接收的数据中提取各个从站的响应帧"""
+    frames = {}
+    offset = 0
+    
+    for slave_id in slave_ids:
+        # 查找从站ID对应的响应帧
+        while offset < len(data):
+            if data[offset] == slave_id and (offset + RESPONSE_LEN) <= len(data):
+                # 找到可能的帧，提取完整响应
+                frame = data[offset:offset + RESPONSE_LEN]
+                frames[slave_id] = frame
+                offset += RESPONSE_LEN
+                break
+            else:
+                offset += 1
+    
+    return frames
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Modbus RTU 帧解析测试工具 - 多从站循环读取')
-    parser.add_argument('-p', '--port', type=str, default='COM35', help='串口端口（默认COM35）')
+    parser = argparse.ArgumentParser(description='Modbus RTU 帧解析测试工具 - 多从站批处理')
+    parser.add_argument('-p', '--port', type=str, default='COM66', help='串口端口（默认COM66）')
     parser.add_argument('-b', '--baudrate', type=int, default=921600, help='波特率（默认921600）')
     parser.add_argument('-s', '--slaves', type=str, default='1,2', help='从站ID列表，逗号分隔（默认1,2）')
     parser.add_argument('-f', '--freq', type=float, default=0, help='读取频率Hz（0=最高频率）')
-    parser.add_argument('-c', '--count', type=int, default=0, help='每个从站读取次数（0=无限循环）')
+    parser.add_argument('-c', '--count', type=int, default=0, help='批次数（0=无限循环，每批包含所有从站）')
+    parser.add_argument('-t', '--inter-delay', type=float, default=0.0001, help='从站间发送延迟（秒，默认0.1ms）')
     
     args = parser.parse_args()
     
@@ -104,7 +125,9 @@ def main():
     
     print(f"串口: {args.port} | 波特率: {args.baudrate} | 从站ID: {slave_ids} | "
           f"频率: {'最高' if args.freq == 0 else f'{args.freq}Hz'} | "
-          f"每个从站次数: {'无限' if args.count == 0 else args.count}")
+          f"批次数: {'无限' if args.count == 0 else args.count} | "
+          f"从站间延迟: {args.inter_delay*1000:.2f}ms")
+    print("【批处理模式】批量发送请求，批量接收响应")
     print("按 Ctrl+C 退出\n")
     
     try:
@@ -114,64 +137,91 @@ def main():
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=0.01  # 减少超时时间以提高频率
+            timeout=0.02  # 批量读取超时
         )
         
         interval = 1.0 / args.freq if args.freq > 0 else 0
+        num_slaves = len(slave_ids)
+        expected_bytes = num_slaves * RESPONSE_LEN
         
         # 统计信息（每个从站独立统计）
         stats = {slave_id: {'count': 0, 'success': 0, 'fail': 0, 'total_time': 0.0} 
                  for slave_id in slave_ids}
         
         try:
-            current_slave_idx = 0
-            loop_count = 0
+            batch_count = 0
             
             while True:
-                # 获取当前从站ID
-                slave_id = slave_ids[current_slave_idx]
+                # 检查是否达到批次限制
+                if args.count > 0 and batch_count >= args.count:
+                    break
                 
-                # 检查是否达到指定次数
-                if args.count > 0 and stats[slave_id]['count'] >= args.count:
-                    # 检查是否所有从站都完成
-                    if all(stats[sid]['count'] >= args.count for sid in slave_ids):
-                        break
-                    # 切换到下一个从站
-                    current_slave_idx = (current_slave_idx + 1) % len(slave_ids)
-                    continue
+                batch_start = time.perf_counter()
                 
-                cycle_start = time.perf_counter()
+                # 【批量发送】快速连续发送所有从站的请求
+                for slave_id in slave_ids:
+                    ser.write(requests[slave_id])
+                    if args.inter_delay > 0:
+                        time.sleep(args.inter_delay)
                 
-                # 发送请求
-                ser.write(requests[slave_id])
                 ser.flush()
-                response = ser.read(RESPONSE_LEN)
                 
-                # 解析响应
-                if len(response) >= RESPONSE_LEN:
-                    result = parse_response(response)
-                    if result:
-                        (accx_ms2, accy_ms2, accz_ms2), (qw, qx, qy, qz) = result
-                        print(f"[从站 0x{slave_id:02X}] ACC:({accx_ms2:7.3f},{accy_ms2:7.3f},{accz_ms2:7.3f})m/s² | "
-                              f"QUAT:({qw:6.4f},{qx:6.4f},{qy:6.4f},{qz:6.4f})")
-                        stats[slave_id]['success'] += 1
-                    else:
-                        print(f"[从站 0x{slave_id:02X}] 解析失败")
+                # 【批量接收】读取所有响应
+                # 使用较大的缓冲区一次性读取
+                all_responses = ser.read(expected_bytes + 100)  # 预留一些额外空间
+                
+                # 【批量处理】解析每个从站的响应
+                offset = 0
+                for slave_id in slave_ids:
+                    # 查找对应从站的响应帧
+                    frame_found = False
+                    search_start = offset
+                    
+                    while offset < len(all_responses):
+                        # 检查是否是当前从站的响应
+                        if all_responses[offset] == slave_id and (offset + RESPONSE_LEN) <= len(all_responses):
+                            # 提取完整帧
+                            frame = all_responses[offset:offset + RESPONSE_LEN]
+                            
+                            # 验证功能码
+                            if frame[1] == 0x03:
+                                result = parse_response(frame)
+                                
+                                cycle_time = time.perf_counter() - batch_start
+                                
+                                if result:
+                                    (accx_ms2, accy_ms2, accz_ms2), (qw, qx, qy, qz) = result
+                                    print(f"[从站 0x{slave_id:02X}] ACC:({accx_ms2:7.3f},{accy_ms2:7.3f},{accz_ms2:7.3f})m/s² | "
+                                          f"QUAT:({qw:6.4f},{qx:6.4f},{qy:6.4f},{qz:6.4f})")
+                                    stats[slave_id]['success'] += 1
+                                else:
+                                    print(f"[从站 0x{slave_id:02X}] 解析失败")
+                                    stats[slave_id]['fail'] += 1
+                                
+                                stats[slave_id]['total_time'] += cycle_time
+                                frame_found = True
+                                offset += RESPONSE_LEN
+                                break
+                        
+                        offset += 1
+                        
+                        # 防止无限搜索
+                        if offset - search_start > expected_bytes:
+                            break
+                    
+                    if not frame_found:
+                        print(f"[从站 0x{slave_id:02X}] 未找到响应帧")
                         stats[slave_id]['fail'] += 1
-                else:
-                    print(f"[从站 0x{slave_id:02X}] 响应超时或不完整")
-                    stats[slave_id]['fail'] += 1
+                        stats[slave_id]['total_time'] += time.perf_counter() - batch_start
+                    
+                    stats[slave_id]['count'] += 1
                 
-                stats[slave_id]['count'] += 1
-                cycle_time = time.perf_counter() - cycle_start
-                stats[slave_id]['total_time'] += cycle_time
-                
-                # 切换到下一个从站
-                current_slave_idx = (current_slave_idx + 1) % len(slave_ids)
+                batch_count += 1
                 
                 # 频率控制
                 if args.freq > 0:
-                    sleep_time = interval - cycle_time
+                    batch_time = time.perf_counter() - batch_start
+                    sleep_time = interval - batch_time
                     if sleep_time > 0:
                         time.sleep(sleep_time)
                         
