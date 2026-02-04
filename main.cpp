@@ -6,8 +6,15 @@
 #define RS485_DE_RE_PIN 25  // Module DE/RE Control
 
 // ================= Serial Configuration =================
-static const uint32_t SERIAL_BAUD = 115200;
+static const uint32_t SERIAL_BAUD = 921600;
 static const uint32_t RS485_BAUD = 921600;
+
+// ================= Output Configuration =================
+static const bool OUTPUT_ENABLED = true;
+static const uint32_t OUTPUT_MIN_INTERVAL_US = 0;
+static const uint8_t OUTPUT_EVERY_N_CYCLES = 1;
+static const uint16_t OUTPUT_MIN_FREE_BYTES = 128;
+static const bool OUTPUT_QUAT = true;
 
 // ================= IMU Configuration =================
 #define NUM_IMUS 2
@@ -48,6 +55,7 @@ ImuData imu_data[NUM_IMUS];
 uint32_t imu_next_allowed_ms[NUM_IMUS];
 uint8_t imu_fail_streak[NUM_IMUS];
 uint8_t imu_retry_left[NUM_IMUS];
+uint8_t request_frames[NUM_IMUS][MODBUS_REQUEST_LEN];
 
 static uint8_t current_imu_index = 0;
 static bool waiting_response = false;
@@ -62,6 +70,7 @@ static uint32_t success_count = 0;
 static uint32_t fail_count = 0;
 static uint32_t last_bus_activity_us = 0;
 static uint32_t last_byte_us = 0;
+static uint32_t last_output_us = 0;
 
 // ================= Utility =================
 static uint16_t crc16_modbus(const uint8_t *data, size_t len) {
@@ -141,14 +150,11 @@ static void buildRequest(uint8_t slave_id, uint8_t *out) {
   out[7] = (crc >> 8) & 0xFF;
 }
 
-static void sendRequest(uint8_t slave_id) {
-  uint8_t request[MODBUS_REQUEST_LEN];
-  buildRequest(slave_id, request);
-
+static void sendRequest(uint8_t imu_index) {
   clearRxBuffer();
   digitalWrite(RS485_DE_RE_PIN, HIGH);
   delayMicroseconds(TX_ENABLE_DELAY_US);
-  Serial2.write(request, sizeof(request));
+  Serial2.write(request_frames[imu_index], MODBUS_REQUEST_LEN);
   Serial2.flush();
   delayMicroseconds(TX_DISABLE_DELAY_US);
   digitalWrite(RS485_DE_RE_PIN, LOW);
@@ -210,6 +216,21 @@ static bool parseResponse(uint8_t slave_id, const uint8_t *buf, size_t len, ImuD
 }
 
 static void outputCycleCsv() {
+  if (!OUTPUT_ENABLED) {
+    return;
+  }
+  if (OUTPUT_EVERY_N_CYCLES > 1 && (cycle_count % OUTPUT_EVERY_N_CYCLES) != 0) {
+    return;
+  }
+  uint32_t now_us = micros();
+  if (OUTPUT_MIN_INTERVAL_US > 0 && (now_us - last_output_us) < OUTPUT_MIN_INTERVAL_US) {
+    return;
+  }
+  if (OUTPUT_MIN_FREE_BYTES > 0 && Serial.availableForWrite() < OUTPUT_MIN_FREE_BYTES) {
+    return;
+  }
+  last_output_us = now_us;
+
   for (uint8_t i = 0; i < NUM_IMUS; ++i) {
     if (i > 0) {
       Serial.print(",");
@@ -222,16 +243,22 @@ static void outputCycleCsv() {
       Serial.print(imu_data[i].acc[1], 3);
       Serial.print(",");
       Serial.print(imu_data[i].acc[2], 3);
-      Serial.print(",");
-      Serial.print(imu_data[i].quat[0], 4);
-      Serial.print(",");
-      Serial.print(imu_data[i].quat[1], 4);
-      Serial.print(",");
-      Serial.print(imu_data[i].quat[2], 4);
-      Serial.print(",");
-      Serial.print(imu_data[i].quat[3], 4);
+      if (OUTPUT_QUAT) {
+        Serial.print(",");
+        Serial.print(imu_data[i].quat[0], 4);
+        Serial.print(",");
+        Serial.print(imu_data[i].quat[1], 4);
+        Serial.print(",");
+        Serial.print(imu_data[i].quat[2], 4);
+        Serial.print(",");
+        Serial.print(imu_data[i].quat[3], 4);
+      }
     } else {
-      Serial.print("0.000,0.000,0.000,0.0000,0.0000,0.0000,0.0000");
+      if (OUTPUT_QUAT) {
+        Serial.print("0.000,0.000,0.000,0.0000,0.0000,0.0000,0.0000");
+      } else {
+        Serial.print("0.000,0.000,0.000");
+      }
     }
   }
   Serial.println();
@@ -288,6 +315,10 @@ static bool pickNextImu(uint32_t now_ms) {
 }
 
 void setup() {
+#ifdef ESP32
+  Serial.setTxBufferSize(2048);
+  Serial2.setRxBufferSize(512);
+#endif
   Serial.begin(SERIAL_BAUD);
   Serial2.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
@@ -299,6 +330,7 @@ void setup() {
     imu_next_allowed_ms[i] = 0;
     imu_fail_streak[i] = 0;
     imu_retry_left[i] = MAX_RETRIES;
+    buildRequest(IMU_IDS[i], request_frames[i]);
   }
 
   Serial.println("# Modbus RTU raw read enabled");
@@ -310,7 +342,11 @@ void setup() {
     Serial.print(IMU_IDS[i]);
   }
   Serial.println();
-  Serial.println("# CSV order: id,accx,accy,accz,qw,qx,qy,qz (repeat)");
+  if (OUTPUT_QUAT) {
+    Serial.println("# CSV order: id,accx,accy,accz,qw,qx,qy,qz (repeat)");
+  } else {
+    Serial.println("# CSV order: id,accx,accy,accz (repeat)");
+  }
 
   last_freq_report_ms = millis();
 }
@@ -320,7 +356,7 @@ void loop() {
     uint32_t now_ms = millis();
     if (busIsIdle() && pickNextImu(now_ms)) {
       response_pos = 0;
-      sendRequest(IMU_IDS[current_imu_index]);
+      sendRequest(current_imu_index);
       waiting_response = true;
       request_start_ms = millis();
     }
