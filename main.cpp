@@ -24,8 +24,11 @@ static const uint16_t RESPONSE_TIMEOUT_MS = 20;
 static const uint32_t BUS_SILENCE_US = 300;
 static const uint32_t TX_ENABLE_DELAY_US = 30;
 static const uint32_t TX_DISABLE_DELAY_US = 60;
+static const uint32_t INTER_BYTE_TIMEOUT_US = 1500;
+static const uint32_t RETRY_DELAY_MS = 2;
 static const uint32_t FAIL_COOLDOWN_MS = 10;
 static const uint8_t MAX_BACKOFF_SHIFT = 4;
+static const uint8_t MAX_RETRIES = 1;
 
 // ================= Data Conversion =================
 static const float ACC_SCALE = 0.0048828f;
@@ -44,6 +47,7 @@ struct ImuData {
 ImuData imu_data[NUM_IMUS];
 uint32_t imu_next_allowed_ms[NUM_IMUS];
 uint8_t imu_fail_streak[NUM_IMUS];
+uint8_t imu_retry_left[NUM_IMUS];
 
 static uint8_t current_imu_index = 0;
 static bool waiting_response = false;
@@ -57,6 +61,7 @@ static uint32_t last_freq_report_ms = 0;
 static uint32_t success_count = 0;
 static uint32_t fail_count = 0;
 static uint32_t last_bus_activity_us = 0;
+static uint32_t last_byte_us = 0;
 
 // ================= Utility =================
 static uint16_t crc16_modbus(const uint8_t *data, size_t len) {
@@ -102,6 +107,7 @@ static void zeroImu(ImuData &data) {
 static void recordSuccess(uint8_t idx) {
   imu_fail_streak[idx] = 0;
   imu_next_allowed_ms[idx] = 0;
+  imu_retry_left[idx] = MAX_RETRIES;
 }
 
 static void recordFailure(uint8_t idx) {
@@ -110,6 +116,17 @@ static void recordFailure(uint8_t idx) {
   }
   uint32_t backoff = FAIL_COOLDOWN_MS << imu_fail_streak[idx];
   imu_next_allowed_ms[idx] = millis() + backoff;
+}
+
+static bool scheduleRetry(uint8_t idx) {
+  if (imu_retry_left[idx] > 0) {
+    imu_retry_left[idx]--;
+    imu_next_allowed_ms[idx] = millis() + RETRY_DELAY_MS;
+    return true;
+  }
+  imu_retry_left[idx] = MAX_RETRIES;
+  recordFailure(idx);
+  return false;
 }
 
 static void buildRequest(uint8_t slave_id, uint8_t *out) {
@@ -136,6 +153,7 @@ static void sendRequest(uint8_t slave_id) {
   delayMicroseconds(TX_DISABLE_DELAY_US);
   digitalWrite(RS485_DE_RE_PIN, LOW);
   last_bus_activity_us = micros();
+  last_byte_us = 0;
 }
 
 static bool parseResponse(uint8_t slave_id, const uint8_t *buf, size_t len, ImuData &out) {
@@ -280,6 +298,7 @@ void setup() {
     zeroImu(imu_data[i]);
     imu_next_allowed_ms[i] = 0;
     imu_fail_streak[i] = 0;
+    imu_retry_left[i] = MAX_RETRIES;
   }
 
   Serial.println("# Modbus RTU raw read enabled");
@@ -313,6 +332,7 @@ void loop() {
       break;
     }
     last_bus_activity_us = micros();
+    last_byte_us = last_bus_activity_us;
     uint8_t byte_in = static_cast<uint8_t>(incoming);
     if (response_pos == 0 && byte_in != IMU_IDS[current_imu_index]) {
       continue;
@@ -338,16 +358,27 @@ void loop() {
       } else {
         fail_count++;
         zeroImu(imu_data[current_imu_index]);
-        recordFailure(current_imu_index);
+        clearRxBuffer();
+        last_bus_activity_us = micros();
+        scheduleRetry(current_imu_index);
       }
+      waiting_response = false;
+      advanceImuIndex();
+    } else if (response_pos > 0 && last_byte_us > 0 &&
+               (micros() - last_byte_us > INTER_BYTE_TIMEOUT_US)) {
+      fail_count++;
+      zeroImu(imu_data[current_imu_index]);
+      clearRxBuffer();
+      last_bus_activity_us = micros();
+      scheduleRetry(current_imu_index);
       waiting_response = false;
       advanceImuIndex();
     } else if (millis() - request_start_ms > RESPONSE_TIMEOUT_MS) {
       fail_count++;
       zeroImu(imu_data[current_imu_index]);
-      recordFailure(current_imu_index);
       clearRxBuffer();
       last_bus_activity_us = micros();
+      scheduleRetry(current_imu_index);
       waiting_response = false;
       advanceImuIndex();
     }
