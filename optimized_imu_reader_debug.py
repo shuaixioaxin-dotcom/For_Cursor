@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""优化的IMU(ACC/QUAT) Modbus RTU读取器"""
+"""优化的IMU读取器 - 调试版本（带详细日志）"""
 
 import serial
 import struct
@@ -46,29 +46,20 @@ CRC16_TABLE = [
 ]
 
 # 预计算常量
-ACC_SCALE = 0.0048828  # 加速度转换系数
-QUAT_SCALE = 0.0001    # 四元数转换系数
-QUAT_OFFSET = 41       # 四元数数据偏移（3 + 38）
-RESPONSE_LEN = 49      # 响应长度
+ACC_SCALE = 0.0048828
+QUAT_SCALE = 0.0001
+QUAT_OFFSET = 41
+RESPONSE_LEN = 49
 
 
-class OptimizedIMUReader:
-    """优化的IMU数据读取器（支持批量读取多个从站的ACC和QUAT数据）"""
+class OptimizedIMUReaderDebug:
+    """优化的IMU读取器 - 调试版本"""
     
-    def __init__(self, port: str, baudrate: int, slave_ids: List[int], logger=None):
-        """
-        初始化IMU读取器
-        
-        Args:
-            port: 串口端口
-            baudrate: 波特率
-            slave_ids: 从站ID列表
-            logger: 日志记录器（可选）
-        """
+    def __init__(self, port: str, baudrate: int, slave_ids: List[int], debug: bool = False):
         self.port = port
         self.baudrate = baudrate
         self.slave_ids = slave_ids
-        self.logger = logger
+        self.debug = debug
         self.connection: Optional[serial.Serial] = None
         self.lock = threading.Lock()
         
@@ -79,6 +70,18 @@ class OptimizedIMUReader:
                 'acc': (0.0, 0.0, 0.0),
                 'quat': (0.0, 0.0, 0.0, 0.0)
             }
+        
+        # 调试统计
+        self.stats = {
+            'total_reads': 0,
+            'successful_frames': {},
+            'failed_crc': {},
+            'missing_frames': {},
+        }
+        for slave_id in slave_ids:
+            self.stats['successful_frames'][slave_id] = 0
+            self.stats['failed_crc'][slave_id] = 0
+            self.stats['missing_frames'][slave_id] = 0
     
     def crc16_modbus(self, data: bytes) -> int:
         """计算Modbus RTU CRC16校验值"""
@@ -102,136 +105,156 @@ class OptimizedIMUReader:
                 timeout=0.01
             )
             
-            if self.logger:
-                self.logger.info(f"已连接到串口 {self.port}，波特率 {self.baudrate}")
+            print(f"✅ 已连接到串口 {self.port}，波特率 {self.baudrate}")
             return True
             
         except Exception as e:
-            if self.logger:
-                self.logger.error(f"连接串口失败: {e}")
+            print(f"❌ 连接串口失败: {e}")
             return False
     
     def disconnect(self):
         """断开串口连接"""
         if self.connection and self.connection.is_open:
             self.connection.close()
-            if self.logger:
-                self.logger.info("已断开串口连接")
+            print("已断开串口连接")
     
     def read_all_imu_optimized(self) -> Dict[int, Dict]:
-        """
-        优化的批量读取所有IMU数据
-        
-        Returns:
-            包含所有从站IMU数据的字典
-        """
+        """优化的批量读取所有IMU数据"""
         if not self.connection or not self.connection.is_open:
             if not self.connect():
                 return self.imu_data.copy()
         
         with self.lock:
             try:
+                self.stats['total_reads'] += 1
+                
                 # 第一阶段：快速发送所有请求
                 requests = []
                 for slave_id in self.slave_ids:
-                    # 构建请求帧：读取寄存器0x0034，长度0x0016（22个寄存器）
                     frame = bytes([slave_id, 0x03, 0x00, 0x34, 0x00, 0x16])
                     crc = self.crc16_modbus(frame)
                     frame += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
                     requests.append((slave_id, frame))
+                    
+                    if self.debug and self.stats['total_reads'] <= 3:
+                        print(f"  发送请求 ID={slave_id}: {frame.hex()}")
                 
                 # 批量发送请求
                 self.connection.reset_input_buffer()
                 for slave_id, frame in requests:
                     self.connection.write(frame)
-                    time.sleep(0.001)  # 发送间隔
+                    time.sleep(0.001)
                 
                 # 第二阶段：批量读取响应
-                # 计算期望接收的总字节数
-                expected_bytes = len(self.slave_ids) * RESPONSE_LEN
                 time.sleep(0.005)  # 增加等待时间，确保所有设备响应
                 
                 # 读取所有可用数据
                 total_response = b''
                 start_time = time.time()
-                timeout = 0.02  # 增加超时时间到20ms
+                timeout = 0.02  # 增加超时时间
                 
                 while time.time() - start_time < timeout:
                     if self.connection.in_waiting > 0:
                         data = self.connection.read(self.connection.in_waiting)
                         total_response += data
-                        # 如果已经接收到足够的数据，可以提前退出
-                        if len(total_response) >= expected_bytes:
-                            break
+                        if self.debug and self.stats['total_reads'] <= 3:
+                            print(f"  读取数据块: {len(data)} 字节")
                     time.sleep(0.001)
+                
+                if self.debug and self.stats['total_reads'] <= 3:
+                    print(f"  总接收数据: {len(total_response)} 字节")
+                    print(f"  数据内容: {total_response.hex()}")
                 
                 # 第三阶段：解析响应
                 self._parse_responses(total_response, requests)
                 
             except Exception as e:
-                if self.logger:
-                    self.logger.error(f"读取IMU数据错误: {e}")
-                # 发生错误时重新连接
+                print(f"❌ 读取IMU数据错误: {e}")
                 self.disconnect()
                 self.connect()
         
         return self.imu_data.copy()
     
     def _parse_responses(self, response_data: bytes, requests: List[Tuple]):
-        """
-        解析响应数据
+        """解析响应数据 - 调试版本"""
+        # 记录本次读取中哪些设备有响应
+        responded_ids = set()
         
-        Args:
-            response_data: 接收到的所有响应数据
-            requests: 请求列表
-        """
-        # 查找响应帧起始位置（从站地址）
+        # 查找响应帧起始位置
         response_frames = []
         current_pos = 0
-        slave_ids = [slave_id for slave_id, _ in requests]
+        
+        if self.debug and self.stats['total_reads'] <= 3:
+            print(f"\n  === 开始解析响应 ===")
         
         while current_pos < len(response_data):
-            # 查找有效的从站地址
+            slave_ids = [slave_id for slave_id, _ in requests]
+            
             if current_pos < len(response_data) and response_data[current_pos] in slave_ids:
-                # 检查是否有完整的响应帧（49字节）
+                slave_id = response_data[current_pos]
+                
+                if self.debug and self.stats['total_reads'] <= 3:
+                    print(f"  位置 {current_pos}: 发现从站地址 {slave_id}")
+                
+                # 检查是否有完整的响应帧
                 if current_pos + RESPONSE_LEN <= len(response_data):
                     frame = response_data[current_pos:current_pos + RESPONSE_LEN]
                     
-                    # 验证长度和功能码
+                    # 验证功能码
                     if len(frame) == RESPONSE_LEN and frame[1] == 0x03:
-                        # 验证字节数（应该是0x2C = 44字节数据）
-                        if frame[2] == 0x2C:
-                            # 验证CRC
-                            crc_calculated = self.crc16_modbus(frame[:RESPONSE_LEN-2])
-                            crc_received = frame[RESPONSE_LEN-2] | (frame[RESPONSE_LEN-1] << 8)
-                            
-                            if crc_calculated == crc_received:
-                                response_frames.append(frame)
-                                current_pos += RESPONSE_LEN
-                                continue
+                        # 验证CRC
+                        crc_calculated = self.crc16_modbus(frame[:RESPONSE_LEN-2])
+                        crc_received = frame[RESPONSE_LEN-2] | (frame[RESPONSE_LEN-1] << 8)
                         
-                    # 如果验证失败，跳过1个字节继续搜索
-                    current_pos += 1
+                        if self.debug and self.stats['total_reads'] <= 3:
+                            print(f"    功能码: 0x{frame[1]:02x}")
+                            print(f"    CRC计算: 0x{crc_calculated:04x}, CRC接收: 0x{crc_received:04x}")
+                        
+                        if crc_calculated == crc_received:
+                            response_frames.append(frame)
+                            responded_ids.add(slave_id)
+                            if self.debug and self.stats['total_reads'] <= 3:
+                                print(f"    ✅ CRC校验通过")
+                        else:
+                            self.stats['failed_crc'][slave_id] += 1
+                            if self.debug and self.stats['total_reads'] <= 3:
+                                print(f"    ❌ CRC校验失败")
+                        
+                        current_pos += RESPONSE_LEN
+                    else:
+                        if self.debug and self.stats['total_reads'] <= 3:
+                            print(f"    功能码不匹配: 0x{frame[1]:02x}")
+                        current_pos += 1
                 else:
-                    # 数据不足，退出循环
+                    if self.debug and self.stats['total_reads'] <= 3:
+                        print(f"  位置 {current_pos}: 数据不足 (剩余 {len(response_data) - current_pos} 字节)")
                     break
             else:
-                # 不是有效的从站地址，继续搜索
                 current_pos += 1
+        
+        # 记录缺失的设备
+        for slave_id in self.slave_ids:
+            if slave_id not in responded_ids:
+                self.stats['missing_frames'][slave_id] += 1
+                if self.debug and self.stats['total_reads'] <= 3:
+                    print(f"  ⚠️ 从站 {slave_id} 没有响应")
+        
+        if self.debug and self.stats['total_reads'] <= 3:
+            print(f"  找到 {len(response_frames)} 个有效响应帧\n")
         
         # 解析每个响应帧
         for frame in response_frames:
             slave_id = frame[0]
             if slave_id in self.slave_ids:
-                # 解析加速度（偏移3-8，3个16位无符号整数）
-                accx_raw, accy_raw, accz_raw = struct.unpack_from('>3H', frame, 3)
+                self.stats['successful_frames'][slave_id] += 1
                 
-                # 转换为有符号并计算m/s²
+                # 解析加速度
+                accx_raw, accy_raw, accz_raw = struct.unpack_from('>3H', frame, 3)
                 accx_ms2 = (accx_raw if accx_raw < 32768 else accx_raw - 65536) * ACC_SCALE
                 accy_ms2 = (accy_raw if accy_raw < 32768 else accy_raw - 65536) * ACC_SCALE
                 accz_ms2 = (accz_raw if accz_raw < 32768 else accz_raw - 65536) * ACC_SCALE
                 
-                # 解析四元数（偏移41-48，4个16位有符号整数）
+                # 解析四元数
                 qw, qx, qy, qz = struct.unpack_from('>4h', frame, QUAT_OFFSET)
                 
                 # 更新数据
@@ -240,79 +263,74 @@ class OptimizedIMUReader:
                     'quat': (round(qw * QUAT_SCALE, 4), round(qx * QUAT_SCALE, 4), 
                             round(qy * QUAT_SCALE, 4), round(qz * QUAT_SCALE, 4))
                 }
+                
+                if self.debug and self.stats['total_reads'] <= 3:
+                    print(f"  ID {slave_id} 数据已更新: ACC={self.imu_data[slave_id]['acc']}")
+    
+    def print_stats(self):
+        """打印统计信息"""
+        print("\n" + "="*70)
+        print("调试统计信息")
+        print("="*70)
+        print(f"总读取次数: {self.stats['total_reads']}")
+        print("\n各设备统计:")
+        for slave_id in self.slave_ids:
+            success = self.stats['successful_frames'][slave_id]
+            failed_crc = self.stats['failed_crc'][slave_id]
+            missing = self.stats['missing_frames'][slave_id]
+            total = self.stats['total_reads']
+            success_rate = (success / total * 100) if total > 0 else 0
+            
+            print(f"\n  从站 ID {slave_id}:")
+            print(f"    成功帧: {success}/{total} ({success_rate:.1f}%)")
+            print(f"    CRC失败: {failed_crc}")
+            print(f"    缺失帧: {missing}")
+        print("="*70)
 
 
 def main():
-    """测试程序"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='优化的IMU(ACC/QUAT) Modbus RTU读取器')
-    parser.add_argument('-p', '--port', type=str, default='COM66', help='串口端口（默认COM66）')
-    parser.add_argument('-b', '--baudrate', type=int, default=921600, help='波特率（默认921600）')
-    parser.add_argument('-i', '--ids', type=str, default='2', help='从站ID列表，逗号分隔（默认2）')
-    parser.add_argument('-f', '--freq', type=float, default=0, help='读取频率Hz（0=最高频率）')
-    parser.add_argument('-c', '--count', type=int, default=0, help='读取次数（0=无限循环）')
+    parser = argparse.ArgumentParser(description='优化的IMU读取器 - 调试版本')
+    parser.add_argument('-p', '--port', type=str, default='COM66', help='串口端口')
+    parser.add_argument('-b', '--baudrate', type=int, default=921600, help='波特率')
+    parser.add_argument('-i', '--ids', type=str, default='1,2', help='从站ID列表')
+    parser.add_argument('-c', '--count', type=int, default=0, help='读取次数（0=无限）')
+    parser.add_argument('-d', '--debug', action='store_true', help='启用调试输出')
     
     args = parser.parse_args()
     
-    # 解析从站ID列表
     slave_ids = [int(id_str.strip()) for id_str in args.ids.split(',')]
     
-    print(f"串口: {args.port} | 波特率: {args.baudrate} | 从站ID: {slave_ids} | "
-          f"频率: {'最高' if args.freq == 0 else f'{args.freq}Hz'} | "
-          f"次数: {'无限' if args.count == 0 else args.count}")
+    print(f"串口: {args.port} | 波特率: {args.baudrate} | 从站ID: {slave_ids}")
+    print(f"调试模式: {'开启' if args.debug else '关闭'}")
     print("按 Ctrl+C 退出\n")
     
-    # 创建读取器
-    reader = OptimizedIMUReader(args.port, args.baudrate, slave_ids)
+    reader = OptimizedIMUReaderDebug(args.port, args.baudrate, slave_ids, debug=args.debug)
     
     if not reader.connect():
-        print("无法连接到串口")
         return
     
     try:
-        interval = 1.0 / args.freq if args.freq > 0 else 0
-        count = success_count = fail_count = 0
-        total_time = 0.0
-        
-        try:
-            while args.count == 0 or count < args.count:
-                cycle_start = time.perf_counter()
-                
-                # 批量读取所有IMU数据
-                imu_data = reader.read_all_imu_optimized()
-                
-                # 显示数据
-                for slave_id in slave_ids:
-                    data = imu_data[slave_id]
-                    acc = data['acc']
-                    quat = data['quat']
-                    print(f"ID:{slave_id:2d} | ACC:({acc[0]:7.3f},{acc[1]:7.3f},{acc[2]:7.3f})m/s² | "
-                          f"QUAT:({quat[0]:6.4f},{quat[1]:6.4f},{quat[2]:6.4f},{quat[3]:6.4f})")
-                
-                success_count += 1
-                count += 1
-                
-                cycle_time = time.perf_counter() - cycle_start
-                total_time += cycle_time
-                
-                if args.freq > 0:
-                    sleep_time = interval - cycle_time
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-                        
-        except KeyboardInterrupt:
-            pass
-        
-        # 统计信息
-        if count > 0:
-            avg_time = total_time / count * 1000
-            max_freq = 1000 / avg_time if avg_time > 0 else 0
-            print(f"\n统计: 总数={count} 成功={success_count} 失败={fail_count} "
-                  f"成功率={success_count/count*100:.1f}% "
-                  f"平均耗时={avg_time:.2f}ms 实际频率={max_freq:.1f}Hz")
-        
+        count = 0
+        while args.count == 0 or count < args.count:
+            imu_data = reader.read_all_imu_optimized()
+            
+            # 显示数据
+            for slave_id in slave_ids:
+                data = imu_data[slave_id]
+                acc = data['acc']
+                quat = data['quat']
+                print(f"ID:{slave_id:2d} | ACC:({acc[0]:7.3f},{acc[1]:7.3f},{acc[2]:7.3f})m/s² | "
+                      f"QUAT:({quat[0]:6.4f},{quat[1]:6.4f},{quat[2]:6.4f},{quat[3]:6.4f})")
+            
+            count += 1
+            time.sleep(0.01)
+            
+    except KeyboardInterrupt:
+        print("\n用户中断")
     finally:
+        reader.print_stats()
         reader.disconnect()
 
 
