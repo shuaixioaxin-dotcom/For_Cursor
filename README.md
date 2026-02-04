@@ -15,6 +15,7 @@ For testing of Cursor
 - **OPTIMIZATION_NOTES.md** - 详细的优化说明和性能分析
 - **QUICK_REFERENCE.md** - 快速参考对比表
 - **VERSION_COMPARISON.md** - 三版本详细对比和使用指南
+- **TROUBLESHOOTING.md** - 完整的故障排查指南（必读！）
 
 ### 🚀 主要优化
 
@@ -62,6 +63,7 @@ For testing of Cursor
 1. **快速了解** → `QUICK_REFERENCE.md`（参数对比表）
 2. **详细分析** → `OPTIMIZATION_NOTES.md`（优化原理和性能计算）
 3. **版本选择** → `VERSION_COMPARISON.md`（三版本对比和使用指南）
+4. **问题解决** → `TROUBLESHOOTING.md`（故障排查和调试方法）
 
 ### 🔍 常见问题
 
