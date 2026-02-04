@@ -15,6 +15,8 @@ static const uint32_t OUTPUT_MIN_INTERVAL_US = 0;
 static const uint8_t OUTPUT_EVERY_N_CYCLES = 1;
 static const uint16_t OUTPUT_MIN_FREE_BYTES = 128;
 static const bool OUTPUT_QUAT = true;
+static const uint8_t ACC_DECIMALS = 3;
+static const uint8_t QUAT_DECIMALS = 4;
 
 // ================= IMU Configuration =================
 #define NUM_IMUS 2
@@ -238,20 +240,20 @@ static void outputCycleCsv() {
     Serial.print(IMU_IDS[i]);
     Serial.print(",");
     if (imu_data[i].valid) {
-      Serial.print(imu_data[i].acc[0], 3);
+      Serial.print(imu_data[i].acc[0], ACC_DECIMALS);
       Serial.print(",");
-      Serial.print(imu_data[i].acc[1], 3);
+      Serial.print(imu_data[i].acc[1], ACC_DECIMALS);
       Serial.print(",");
-      Serial.print(imu_data[i].acc[2], 3);
+      Serial.print(imu_data[i].acc[2], ACC_DECIMALS);
       if (OUTPUT_QUAT) {
         Serial.print(",");
-        Serial.print(imu_data[i].quat[0], 4);
+        Serial.print(imu_data[i].quat[0], QUAT_DECIMALS);
         Serial.print(",");
-        Serial.print(imu_data[i].quat[1], 4);
+        Serial.print(imu_data[i].quat[1], QUAT_DECIMALS);
         Serial.print(",");
-        Serial.print(imu_data[i].quat[2], 4);
+        Serial.print(imu_data[i].quat[2], QUAT_DECIMALS);
         Serial.print(",");
-        Serial.print(imu_data[i].quat[3], 4);
+        Serial.print(imu_data[i].quat[3], QUAT_DECIMALS);
       }
     } else {
       if (OUTPUT_QUAT) {
@@ -420,7 +422,8 @@ void loop() {
     }
   }
 
-  if (millis() - last_freq_report_ms >= FREQ_REPORT_INTERVAL_MS) {
+  if (FREQ_REPORT_INTERVAL_MS > 0 &&
+      (millis() - last_freq_report_ms >= FREQ_REPORT_INTERVAL_MS)) {
     last_freq_report_ms = millis();
     reportFrequency();
   }
