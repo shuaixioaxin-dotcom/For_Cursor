@@ -17,6 +17,7 @@ static const uint16_t OUTPUT_MIN_FREE_BYTES = 128;
 static const bool OUTPUT_QUAT = true;
 static const uint8_t ACC_DECIMALS = 3;
 static const uint8_t QUAT_DECIMALS = 4;
+static const size_t OUTPUT_BUF_SIZE = 256;
 
 // ================= IMU Configuration =================
 #define NUM_IMUS 2
@@ -150,27 +151,53 @@ static int32_t scaleAccMilli(int16_t raw) {
   return value / ACC_SCALE_DEN;
 }
 
-static void printFixed(int32_t value, uint8_t decimals) {
+static void appendChar(char *buf, size_t &len, char c) {
+  if (len < OUTPUT_BUF_SIZE) {
+    buf[len++] = c;
+  }
+}
+
+static void appendUInt(char *buf, size_t &len, uint32_t value) {
+  char tmp[10];
+  size_t idx = 0;
+  do {
+    tmp[idx++] = static_cast<char>('0' + (value % 10));
+    value /= 10;
+  } while (value > 0 && idx < sizeof(tmp));
+  while (idx > 0 && len < OUTPUT_BUF_SIZE) {
+    buf[len++] = tmp[--idx];
+  }
+}
+
+static void appendInt(char *buf, size_t &len, int32_t value) {
+  if (value < 0) {
+    appendChar(buf, len, '-');
+    value = -value;
+  }
+  appendUInt(buf, len, static_cast<uint32_t>(value));
+}
+
+static void appendFixed(char *buf, size_t &len, int32_t value, uint8_t decimals) {
   static const int32_t pow10_table[] = {1, 10, 100, 1000, 10000};
   if (decimals > 4) {
     decimals = 4;
   }
   if (value < 0) {
-    Serial.print('-');
+    appendChar(buf, len, '-');
     value = -value;
   }
   int32_t scale = pow10_table[decimals];
   int32_t int_part = value / scale;
   int32_t frac = value % scale;
-  Serial.print(int_part);
+  appendUInt(buf, len, static_cast<uint32_t>(int_part));
   if (decimals == 0) {
     return;
   }
-  Serial.print('.');
+  appendChar(buf, len, '.');
   int32_t divisor = scale / 10;
   for (uint8_t i = 0; i < decimals; ++i) {
     int32_t digit = (frac / divisor) % 10;
-    Serial.print(digit);
+    appendChar(buf, len, static_cast<char>('0' + digit));
     divisor /= 10;
   }
 }
@@ -263,52 +290,55 @@ static void outputCycleCsv() {
   if (OUTPUT_MIN_INTERVAL_US > 0 && (now_us - last_output_us) < OUTPUT_MIN_INTERVAL_US) {
     return;
   }
-  if (OUTPUT_MIN_FREE_BYTES > 0 && Serial.availableForWrite() < OUTPUT_MIN_FREE_BYTES) {
-    return;
-  }
-  last_output_us = now_us;
-
+  char out_buf[OUTPUT_BUF_SIZE];
+  size_t out_len = 0;
   for (uint8_t i = 0; i < NUM_IMUS; ++i) {
     if (i > 0) {
-      Serial.print(",");
+      appendChar(out_buf, out_len, ',');
     }
-    Serial.print(IMU_IDS[i]);
-    Serial.print(",");
+    appendUInt(out_buf, out_len, IMU_IDS[i]);
+    appendChar(out_buf, out_len, ',');
     if (imu_data[i].valid) {
-      printFixed(imu_data[i].acc_milli[0], ACC_DECIMALS);
-      Serial.print(",");
-      printFixed(imu_data[i].acc_milli[1], ACC_DECIMALS);
-      Serial.print(",");
-      printFixed(imu_data[i].acc_milli[2], ACC_DECIMALS);
+      appendFixed(out_buf, out_len, imu_data[i].acc_milli[0], ACC_DECIMALS);
+      appendChar(out_buf, out_len, ',');
+      appendFixed(out_buf, out_len, imu_data[i].acc_milli[1], ACC_DECIMALS);
+      appendChar(out_buf, out_len, ',');
+      appendFixed(out_buf, out_len, imu_data[i].acc_milli[2], ACC_DECIMALS);
       if (OUTPUT_QUAT) {
-        Serial.print(",");
-        printFixed(imu_data[i].quat_raw[0], QUAT_DECIMALS);
-        Serial.print(",");
-        printFixed(imu_data[i].quat_raw[1], QUAT_DECIMALS);
-        Serial.print(",");
-        printFixed(imu_data[i].quat_raw[2], QUAT_DECIMALS);
-        Serial.print(",");
-        printFixed(imu_data[i].quat_raw[3], QUAT_DECIMALS);
+        appendChar(out_buf, out_len, ',');
+        appendFixed(out_buf, out_len, imu_data[i].quat_raw[0], QUAT_DECIMALS);
+        appendChar(out_buf, out_len, ',');
+        appendFixed(out_buf, out_len, imu_data[i].quat_raw[1], QUAT_DECIMALS);
+        appendChar(out_buf, out_len, ',');
+        appendFixed(out_buf, out_len, imu_data[i].quat_raw[2], QUAT_DECIMALS);
+        appendChar(out_buf, out_len, ',');
+        appendFixed(out_buf, out_len, imu_data[i].quat_raw[3], QUAT_DECIMALS);
       }
     } else {
-      printFixed(0, ACC_DECIMALS);
-      Serial.print(",");
-      printFixed(0, ACC_DECIMALS);
-      Serial.print(",");
-      printFixed(0, ACC_DECIMALS);
+      appendFixed(out_buf, out_len, 0, ACC_DECIMALS);
+      appendChar(out_buf, out_len, ',');
+      appendFixed(out_buf, out_len, 0, ACC_DECIMALS);
+      appendChar(out_buf, out_len, ',');
+      appendFixed(out_buf, out_len, 0, ACC_DECIMALS);
       if (OUTPUT_QUAT) {
-        Serial.print(",");
-        printFixed(0, QUAT_DECIMALS);
-        Serial.print(",");
-        printFixed(0, QUAT_DECIMALS);
-        Serial.print(",");
-        printFixed(0, QUAT_DECIMALS);
-        Serial.print(",");
-        printFixed(0, QUAT_DECIMALS);
+        appendChar(out_buf, out_len, ',');
+        appendFixed(out_buf, out_len, 0, QUAT_DECIMALS);
+        appendChar(out_buf, out_len, ',');
+        appendFixed(out_buf, out_len, 0, QUAT_DECIMALS);
+        appendChar(out_buf, out_len, ',');
+        appendFixed(out_buf, out_len, 0, QUAT_DECIMALS);
+        appendChar(out_buf, out_len, ',');
+        appendFixed(out_buf, out_len, 0, QUAT_DECIMALS);
       }
     }
   }
-  Serial.println();
+  appendChar(out_buf, out_len, '\n');
+  if (OUTPUT_MIN_FREE_BYTES > 0 &&
+      Serial.availableForWrite() < (OUTPUT_MIN_FREE_BYTES + out_len)) {
+    return;
+  }
+  Serial.write(reinterpret_cast<const uint8_t *>(out_buf), out_len);
+  last_output_us = now_us;
 }
 
 static void reportFrequency() {
