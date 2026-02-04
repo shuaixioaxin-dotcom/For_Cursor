@@ -58,11 +58,14 @@ reader.disconnect()
 
 | 文件 | 说明 |
 |------|------|
-| `optimized_imu_reader.py` | 优化的IMU读取器核心代码 |
+| `optimized_imu_reader.py` | 优化的IMU读取器核心代码 ⭐ |
+| `optimized_imu_reader_debug.py` | 调试版本（带详细日志） 🔧 |
 | `test_performance.py` | 性能测试工具 |
-| `QUICK_START.md` | 快速入门指南（推荐阅读） |
+| `QUICK_START.md` | 快速入门指南（推荐阅读）📖 |
+| `TROUBLESHOOTING.md` | 故障排查指南 🔧 |
 | `IMU_OPTIMIZATION_README.md` | 详细技术文档 |
 | `OPTIMIZATION_COMPARISON.md` | 优化前后对比分析 |
+| `PROJECT_SUMMARY.md` | 项目完成总结 |
 
 ## 优化原理
 
@@ -109,12 +112,17 @@ reader.disconnect()
 ### 新手入门
 👉 **推荐先阅读**: [QUICK_START.md](QUICK_START.md)
 
+### 遇到问题？
+🔧 **故障排查**: [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - 常见问题诊断和解决方案
+
 ### 深入了解
 - [IMU_OPTIMIZATION_README.md](IMU_OPTIMIZATION_README.md) - 技术细节和使用方法
 - [OPTIMIZATION_COMPARISON.md](OPTIMIZATION_COMPARISON.md) - 详细的性能对比分析
+- [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) - 项目完成总结
 
 ### 工具使用
 - `python optimized_imu_reader.py --help` - 主程序帮助
+- `python optimized_imu_reader_debug.py --help` - 调试版本帮助
 - `python test_performance.py --help` - 测试工具帮助
 
 ## 系统要求
@@ -126,6 +134,15 @@ reader.disconnect()
 
 ## 常见问题
 
+### Q: 某个设备的数据不更新怎么办？
+A: 这是最常见的问题。请查看 **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** 获取详细的诊断流程和解决方案。
+
+快速解决：
+```bash
+# 使用调试版本诊断
+python optimized_imu_reader_debug.py -p COM66 -b 921600 -i "1,2" -d -c 20
+```
+
 ### Q: 如何选择波特率？
 A: 推荐使用921600以获得最佳性能。如果出现通信错误，可以降低到460800或115200。
 
@@ -133,7 +150,7 @@ A: 推荐使用921600以获得最佳性能。如果出现通信错误，可以�
 A: 理论上支持247个设备（Modbus标准）。实际建议不超过16个以保证响应速度。
 
 ### Q: 如何处理CRC校验失败？
-A: 检查串口线缆质量、降低波特率、减少设备数量、增加等待时间。详见 [QUICK_START.md](QUICK_START.md)。
+A: 检查串口线缆质量、降低波特率、减少设备数量、增加等待时间。详见 **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**。
 
 ## 贡献指南
 
