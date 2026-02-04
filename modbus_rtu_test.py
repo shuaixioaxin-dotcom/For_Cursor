@@ -46,8 +46,7 @@ CRC16_TABLE = [
 
 # 常量
 ACC_SCALE = 0.0048828
-QUAT_SCALE = 0.0001
-RESPONSE_LEN = 49
+RESPONSE_LEN = 11  # 1(ID) + 1(功能码) + 1(字节数) + 6(3个加速度) + 2(CRC) = 11字节
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -59,8 +58,8 @@ def crc16_modbus(data: bytes) -> int:
 
 
 def build_request(slave_id: int) -> bytes:
-    """构建Modbus RTU请求帧"""
-    request_data = bytes([slave_id, 0x03, 0x00, 0x34, 0x00, 0x16])
+    """构建Modbus RTU请求帧 - 读取3个加速度寄存器(0x34-0x36)"""
+    request_data = bytes([slave_id, 0x03, 0x00, 0x34, 0x00, 0x03])
     crc = crc16_modbus(request_data)
     return request_data + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
@@ -82,8 +81,8 @@ def read_response(ser: serial.Serial, expected_len: int) -> bytes:
     return ser.read(expected_len)
 
 
-def parse_response(response: bytes, slave_id: int, verbose: bool) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]]:
-    """解析Modbus响应帧"""
+def parse_response(response: bytes, slave_id: int, verbose: bool) -> Optional[Tuple[float, float, float]]:
+    """解析Modbus响应帧 - 仅解析加速度"""
     # 检查长度
     if len(response) < RESPONSE_LEN:
         if verbose:
@@ -108,22 +107,25 @@ def parse_response(response: bytes, slave_id: int, verbose: bool) -> Optional[Tu
             print(f"[ID:0x{slave_id:02X}] 功能码错误(收到0x{response[1]:02X})")
         return None
     
+    # 验证字节数
+    if response[2] != 0x06:
+        if verbose:
+            print(f"[ID:0x{slave_id:02X}] 字节数错误(期望0x06,收到0x{response[2]:02X})")
+        return None
+    
     # 验证CRC
     if not verify_crc(response):
         if verbose:
             print(f"[ID:0x{slave_id:02X}] CRC校验失败: {response.hex()}")
         return None
     
-    # 解析加速度
+    # 解析加速度（偏移3开始，3个16位无符号整数）
     accx_raw, accy_raw, accz_raw = struct.unpack_from('>3H', response, 3)
     accx_ms2 = (accx_raw if accx_raw < 32768 else accx_raw - 65536) * ACC_SCALE
     accy_ms2 = (accy_raw if accy_raw < 32768 else accy_raw - 65536) * ACC_SCALE
     accz_ms2 = (accz_raw if accz_raw < 32768 else accz_raw - 65536) * ACC_SCALE
     
-    # 解析四元数
-    qw, qx, qy, qz = struct.unpack_from('>4h', response, 41)
-    
-    return ((accx_ms2, accy_ms2, accz_ms2), (qw * QUAT_SCALE, qx * QUAT_SCALE, qy * QUAT_SCALE, qz * QUAT_SCALE))
+    return (accx_ms2, accy_ms2, accz_ms2)
 
 
 def parse_slave_ids(ids_str: str) -> List[int]:
@@ -222,9 +224,8 @@ def main():
                     result = parse_response(response, slave_id, args.verbose)
                     
                     if result:
-                        (accx_ms2, accy_ms2, accz_ms2), (qw, qx, qy, qz) = result
-                        print(f"[ID:0x{slave_id:02X}] ACC:({accx_ms2:7.3f},{accy_ms2:7.3f},{accz_ms2:7.3f})m/s² | "
-                              f"QUAT:({qw:6.4f},{qx:6.4f},{qy:6.4f},{qz:6.4f}) | {request_time*1000:.2f}ms")
+                        accx_ms2, accy_ms2, accz_ms2 = result
+                        print(f"[ID:0x{slave_id:02X}] ACC:({accx_ms2:7.3f}, {accy_ms2:7.3f}, {accz_ms2:7.3f}) m/s² | {request_time*1000:.2f}ms")
                         stats[slave_id]['success'] += 1
                     else:
                         stats[slave_id]['fail'] += 1
