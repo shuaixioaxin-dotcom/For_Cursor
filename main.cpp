@@ -24,12 +24,12 @@ static const uint16_t RESPONSE_TIMEOUT_MS = 20;
 static const uint32_t BUS_SILENCE_US = 300;
 static const uint32_t TX_ENABLE_DELAY_US = 30;
 static const uint32_t TX_DISABLE_DELAY_US = 60;
+static const uint32_t FAIL_COOLDOWN_MS = 10;
+static const uint8_t MAX_BACKOFF_SHIFT = 4;
 
 // ================= Data Conversion =================
 static const float ACC_SCALE = 0.0048828f;
 static const float QUAT_SCALE = 0.0001f;
-// If you change MODBUS_REG_COUNT, update QUAT_OFFSET accordingly.
-static const uint8_t QUAT_OFFSET = 41;  // 3 + 38
 
 // ================= Frequency Monitoring =================
 static const uint32_t FREQ_REPORT_INTERVAL_MS = 1000;
@@ -42,6 +42,8 @@ struct ImuData {
 };
 
 ImuData imu_data[NUM_IMUS];
+uint32_t imu_next_allowed_ms[NUM_IMUS];
+uint8_t imu_fail_streak[NUM_IMUS];
 
 static uint8_t current_imu_index = 0;
 static bool waiting_response = false;
@@ -97,6 +99,19 @@ static void zeroImu(ImuData &data) {
   data.last_update_ms = 0;
 }
 
+static void recordSuccess(uint8_t idx) {
+  imu_fail_streak[idx] = 0;
+  imu_next_allowed_ms[idx] = 0;
+}
+
+static void recordFailure(uint8_t idx) {
+  if (imu_fail_streak[idx] < MAX_BACKOFF_SHIFT) {
+    imu_fail_streak[idx]++;
+  }
+  uint32_t backoff = FAIL_COOLDOWN_MS << imu_fail_streak[idx];
+  imu_next_allowed_ms[idx] = millis() + backoff;
+}
+
 static void buildRequest(uint8_t slave_id, uint8_t *out) {
   out[0] = slave_id;
   out[1] = MODBUS_FUNC_READ_HREG;
@@ -150,21 +165,25 @@ static bool parseResponse(uint8_t slave_id, const uint8_t *buf, size_t len, ImuD
   out.acc[1] = static_cast<float>(ay) * ACC_SCALE;
   out.acc[2] = static_cast<float>(az) * ACC_SCALE;
 
-  if (QUAT_OFFSET + 8 <= data_start + buf[2]) {
-    int16_t qw = static_cast<int16_t>((buf[QUAT_OFFSET] << 8) | buf[QUAT_OFFSET + 1]);
-    int16_t qx = static_cast<int16_t>((buf[QUAT_OFFSET + 2] << 8) | buf[QUAT_OFFSET + 3]);
-    int16_t qy = static_cast<int16_t>((buf[QUAT_OFFSET + 4] << 8) | buf[QUAT_OFFSET + 5]);
-    int16_t qz = static_cast<int16_t>((buf[QUAT_OFFSET + 6] << 8) | buf[QUAT_OFFSET + 7]);
+  if (buf[2] < 8) {
+    out.quat[0] = 0.0f;
+    out.quat[1] = 0.0f;
+    out.quat[2] = 0.0f;
+    out.quat[3] = 0.0f;
+  } else {
+    size_t quat_offset = data_start + (buf[2] - 8);
+    if (quat_offset + 8 > len - 2) {
+      return false;
+    }
+    int16_t qw = static_cast<int16_t>((buf[quat_offset] << 8) | buf[quat_offset + 1]);
+    int16_t qx = static_cast<int16_t>((buf[quat_offset + 2] << 8) | buf[quat_offset + 3]);
+    int16_t qy = static_cast<int16_t>((buf[quat_offset + 4] << 8) | buf[quat_offset + 5]);
+    int16_t qz = static_cast<int16_t>((buf[quat_offset + 6] << 8) | buf[quat_offset + 7]);
 
     out.quat[0] = static_cast<float>(qw) * QUAT_SCALE;
     out.quat[1] = static_cast<float>(qx) * QUAT_SCALE;
     out.quat[2] = static_cast<float>(qy) * QUAT_SCALE;
     out.quat[3] = static_cast<float>(qz) * QUAT_SCALE;
-  } else {
-    out.quat[0] = 0.0f;
-    out.quat[1] = 0.0f;
-    out.quat[2] = 0.0f;
-    out.quat[3] = 0.0f;
   }
 
   out.valid = true;
@@ -239,6 +258,17 @@ static void advanceImuIndex() {
   }
 }
 
+static bool pickNextImu(uint32_t now_ms) {
+  for (uint8_t offset = 0; offset < NUM_IMUS; ++offset) {
+    uint8_t idx = (current_imu_index + offset) % NUM_IMUS;
+    if (now_ms >= imu_next_allowed_ms[idx]) {
+      current_imu_index = idx;
+      return true;
+    }
+  }
+  return false;
+}
+
 void setup() {
   Serial.begin(SERIAL_BAUD);
   Serial2.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
@@ -248,6 +278,8 @@ void setup() {
 
   for (uint8_t i = 0; i < NUM_IMUS; ++i) {
     zeroImu(imu_data[i]);
+    imu_next_allowed_ms[i] = 0;
+    imu_fail_streak[i] = 0;
   }
 
   Serial.println("# Modbus RTU raw read enabled");
@@ -266,7 +298,8 @@ void setup() {
 
 void loop() {
   if (!waiting_response) {
-    if (busIsIdle()) {
+    uint32_t now_ms = millis();
+    if (busIsIdle() && pickNextImu(now_ms)) {
       response_pos = 0;
       sendRequest(IMU_IDS[current_imu_index]);
       waiting_response = true;
@@ -301,15 +334,20 @@ void loop() {
                               imu_data[current_imu_index]);
       if (ok) {
         success_count++;
+        recordSuccess(current_imu_index);
       } else {
         fail_count++;
         zeroImu(imu_data[current_imu_index]);
+        recordFailure(current_imu_index);
       }
       waiting_response = false;
       advanceImuIndex();
     } else if (millis() - request_start_ms > RESPONSE_TIMEOUT_MS) {
       fail_count++;
       zeroImu(imu_data[current_imu_index]);
+      recordFailure(current_imu_index);
+      clearRxBuffer();
+      last_bus_activity_us = micros();
       waiting_response = false;
       advanceImuIndex();
     }
