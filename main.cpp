@@ -20,13 +20,16 @@ static const uint16_t MODBUS_REG_COUNT = 0x0016;  // 22 registers
 static const uint8_t MODBUS_REQUEST_LEN = 8;
 static const uint16_t RESPONSE_BYTE_COUNT = MODBUS_REG_COUNT * 2;
 static const uint16_t RESPONSE_LEN = 1 + 1 + 1 + RESPONSE_BYTE_COUNT + 2;
-static const uint16_t RESPONSE_TIMEOUT_MS = 8;
+static const uint16_t RESPONSE_TIMEOUT_MS = 20;
+static const uint32_t BUS_SILENCE_US = 300;
+static const uint32_t TX_ENABLE_DELAY_US = 30;
+static const uint32_t TX_DISABLE_DELAY_US = 60;
 
 // ================= Data Conversion =================
 static const float ACC_SCALE = 0.0048828f;
 static const float QUAT_SCALE = 0.0001f;
 // If you change MODBUS_REG_COUNT, update QUAT_OFFSET accordingly.
-static const uint8_t QUAT_OFFSET = 39;  // 3 + 36
+static const uint8_t QUAT_OFFSET = 41;  // 3 + 38
 
 // ================= Frequency Monitoring =================
 static const uint32_t FREQ_REPORT_INTERVAL_MS = 1000;
@@ -51,6 +54,7 @@ static uint32_t freq_start_ms = 0;
 static uint32_t last_freq_report_ms = 0;
 static uint32_t success_count = 0;
 static uint32_t fail_count = 0;
+static uint32_t last_bus_activity_us = 0;
 
 // ================= Utility =================
 static uint16_t crc16_modbus(const uint8_t *data, size_t len) {
@@ -72,6 +76,13 @@ static void clearRxBuffer() {
   while (Serial2.available() > 0) {
     Serial2.read();
   }
+}
+
+static bool busIsIdle() {
+  if (last_bus_activity_us == 0) {
+    return true;
+  }
+  return (micros() - last_bus_activity_us) >= BUS_SILENCE_US;
 }
 
 static void zeroImu(ImuData &data) {
@@ -104,11 +115,12 @@ static void sendRequest(uint8_t slave_id) {
 
   clearRxBuffer();
   digitalWrite(RS485_DE_RE_PIN, HIGH);
-  delayMicroseconds(20);
+  delayMicroseconds(TX_ENABLE_DELAY_US);
   Serial2.write(request, sizeof(request));
   Serial2.flush();
-  delayMicroseconds(20);
+  delayMicroseconds(TX_DISABLE_DELAY_US);
   digitalWrite(RS485_DE_RE_PIN, LOW);
+  last_bus_activity_us = micros();
 }
 
 static bool parseResponse(uint8_t slave_id, const uint8_t *buf, size_t len, ImuData &out) {
@@ -254,14 +266,33 @@ void setup() {
 
 void loop() {
   if (!waiting_response) {
-    response_pos = 0;
-    sendRequest(IMU_IDS[current_imu_index]);
-    waiting_response = true;
-    request_start_ms = millis();
+    if (busIsIdle()) {
+      response_pos = 0;
+      sendRequest(IMU_IDS[current_imu_index]);
+      waiting_response = true;
+      request_start_ms = millis();
+    }
   }
 
   while (waiting_response && Serial2.available() > 0 && response_pos < RESPONSE_LEN) {
-    response_buf[response_pos++] = static_cast<uint8_t>(Serial2.read());
+    int incoming = Serial2.read();
+    if (incoming < 0) {
+      break;
+    }
+    last_bus_activity_us = micros();
+    uint8_t byte_in = static_cast<uint8_t>(incoming);
+    if (response_pos == 0 && byte_in != IMU_IDS[current_imu_index]) {
+      continue;
+    }
+    if (response_pos == 1 && byte_in != MODBUS_FUNC_READ_HREG) {
+      response_pos = 0;
+      continue;
+    }
+    if (response_pos == 2 && byte_in != RESPONSE_BYTE_COUNT) {
+      response_pos = 0;
+      continue;
+    }
+    response_buf[response_pos++] = byte_in;
   }
 
   if (waiting_response) {
