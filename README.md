@@ -7,9 +7,14 @@ For testing of Cursor
 
 ### 📁 项目文件
 
-- **imu_200hz_optimized.ino** - 优化后的Arduino主程序
+#### 核心代码
+- **imu_200hz_optimized.ino** - 生产版本（极致性能，纯净输出）
+- **imu_200hz_with_monitoring.ino** - 监控版本（带性能统计，用于调试）
+
+#### 文档
 - **OPTIMIZATION_NOTES.md** - 详细的优化说明和性能分析
 - **QUICK_REFERENCE.md** - 快速参考对比表
+- **VERSION_COMPARISON.md** - 三版本详细对比和使用指南
 
 ### 🚀 主要优化
 
@@ -31,13 +36,40 @@ For testing of Cursor
 - 支持Modbus RTU的IMU传感器（ID: 1, 2）
 - 波特率：921600
 
-### 📖 使用说明
+### 🚦 快速开始
 
-1. 查看`QUICK_REFERENCE.md`了解优化要点
-2. 阅读`OPTIMIZATION_NOTES.md`获取详细信息
-3. 上传`imu_200hz_optimized.ino`到ESP32
-4. 监控串口输出（2000000波特率）
+#### 1. 验证和调试（推荐新用户）
+```bash
+# 上传监控版本
+上传: imu_200hz_with_monitoring.ino
+波特率: 2000000
+```
+查看串口输出，确认：
+- ✅ 采样率 >200Hz
+- ✅ 成功率 >98%
+- ✅ 超时和CRC错误接近0
 
-### 🔍 调试提示
+#### 2. 生产部署
+```bash
+# 上传生产版本
+上传: imu_200hz_optimized.ino
+波特率: 2000000
+```
+获得最大性能和最小开销
 
-如遇到问题，请参考`OPTIMIZATION_NOTES.md`中的"调试建议"章节。
+### 📖 详细文档
+
+1. **快速了解** → `QUICK_REFERENCE.md`（参数对比表）
+2. **详细分析** → `OPTIMIZATION_NOTES.md`（优化原理和性能计算）
+3. **版本选择** → `VERSION_COMPARISON.md`（三版本对比和使用指南）
+
+### 🔍 常见问题
+
+**Q: 采样率达不到200Hz？**  
+A: 检查监控版的统计数据，参考`VERSION_COMPARISON.md`中的调整指南
+
+**Q: 出现大量超时或CRC错误？**  
+A: 检查硬件连接、电缆质量、终端电阻配置
+
+**Q: 两个版本有什么区别？**  
+A: 生产版无统计开销（最快），监控版有实时性能报告（便于调试）
