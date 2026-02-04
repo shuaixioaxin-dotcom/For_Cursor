@@ -40,15 +40,15 @@ static const uint8_t MAX_BACKOFF_SHIFT = 4;
 static const uint8_t MAX_RETRIES = 1;
 
 // ================= Data Conversion =================
-static const float ACC_SCALE = 0.0048828f;
-static const float QUAT_SCALE = 0.0001f;
+static const int32_t ACC_SCALE_NUM = 48828;
+static const int32_t ACC_SCALE_DEN = 10000;
 
 // ================= Frequency Monitoring =================
 static const uint32_t FREQ_REPORT_INTERVAL_MS = 1000;
 
 struct ImuData {
-  float acc[3];
-  float quat[4];
+  int32_t acc_milli[3];
+  int16_t quat_raw[4];
   bool valid;
   uint32_t last_update_ms;
 };
@@ -104,13 +104,13 @@ static bool busIsIdle() {
 }
 
 static void zeroImu(ImuData &data) {
-  data.acc[0] = 0.0f;
-  data.acc[1] = 0.0f;
-  data.acc[2] = 0.0f;
-  data.quat[0] = 0.0f;
-  data.quat[1] = 0.0f;
-  data.quat[2] = 0.0f;
-  data.quat[3] = 0.0f;
+  data.acc_milli[0] = 0;
+  data.acc_milli[1] = 0;
+  data.acc_milli[2] = 0;
+  data.quat_raw[0] = 0;
+  data.quat_raw[1] = 0;
+  data.quat_raw[2] = 0;
+  data.quat_raw[3] = 0;
   data.valid = false;
   data.last_update_ms = 0;
 }
@@ -138,6 +138,41 @@ static bool scheduleRetry(uint8_t idx) {
   imu_retry_left[idx] = MAX_RETRIES;
   recordFailure(idx);
   return false;
+}
+
+static int32_t scaleAccMilli(int16_t raw) {
+  int32_t value = static_cast<int32_t>(raw) * ACC_SCALE_NUM;
+  if (value >= 0) {
+    value += ACC_SCALE_DEN / 2;
+  } else {
+    value -= ACC_SCALE_DEN / 2;
+  }
+  return value / ACC_SCALE_DEN;
+}
+
+static void printFixed(int32_t value, uint8_t decimals) {
+  static const int32_t pow10_table[] = {1, 10, 100, 1000, 10000};
+  if (decimals > 4) {
+    decimals = 4;
+  }
+  if (value < 0) {
+    Serial.print('-');
+    value = -value;
+  }
+  int32_t scale = pow10_table[decimals];
+  int32_t int_part = value / scale;
+  int32_t frac = value % scale;
+  Serial.print(int_part);
+  if (decimals == 0) {
+    return;
+  }
+  Serial.print('.');
+  int32_t divisor = scale / 10;
+  for (uint8_t i = 0; i < decimals; ++i) {
+    int32_t digit = (frac / divisor) % 10;
+    Serial.print(digit);
+    divisor /= 10;
+  }
 }
 
 static void buildRequest(uint8_t slave_id, uint8_t *out) {
@@ -187,15 +222,15 @@ static bool parseResponse(uint8_t slave_id, const uint8_t *buf, size_t len, ImuD
   int16_t ay = static_cast<int16_t>((buf[data_start + 2] << 8) | buf[data_start + 3]);
   int16_t az = static_cast<int16_t>((buf[data_start + 4] << 8) | buf[data_start + 5]);
 
-  out.acc[0] = static_cast<float>(ax) * ACC_SCALE;
-  out.acc[1] = static_cast<float>(ay) * ACC_SCALE;
-  out.acc[2] = static_cast<float>(az) * ACC_SCALE;
+  out.acc_milli[0] = scaleAccMilli(ax);
+  out.acc_milli[1] = scaleAccMilli(ay);
+  out.acc_milli[2] = scaleAccMilli(az);
 
   if (buf[2] < 8) {
-    out.quat[0] = 0.0f;
-    out.quat[1] = 0.0f;
-    out.quat[2] = 0.0f;
-    out.quat[3] = 0.0f;
+    out.quat_raw[0] = 0;
+    out.quat_raw[1] = 0;
+    out.quat_raw[2] = 0;
+    out.quat_raw[3] = 0;
   } else {
     size_t quat_offset = data_start + (buf[2] - 8);
     if (quat_offset + 8 > len - 2) {
@@ -206,10 +241,10 @@ static bool parseResponse(uint8_t slave_id, const uint8_t *buf, size_t len, ImuD
     int16_t qy = static_cast<int16_t>((buf[quat_offset + 4] << 8) | buf[quat_offset + 5]);
     int16_t qz = static_cast<int16_t>((buf[quat_offset + 6] << 8) | buf[quat_offset + 7]);
 
-    out.quat[0] = static_cast<float>(qw) * QUAT_SCALE;
-    out.quat[1] = static_cast<float>(qx) * QUAT_SCALE;
-    out.quat[2] = static_cast<float>(qy) * QUAT_SCALE;
-    out.quat[3] = static_cast<float>(qz) * QUAT_SCALE;
+    out.quat_raw[0] = qw;
+    out.quat_raw[1] = qx;
+    out.quat_raw[2] = qy;
+    out.quat_raw[3] = qz;
   }
 
   out.valid = true;
@@ -240,26 +275,36 @@ static void outputCycleCsv() {
     Serial.print(IMU_IDS[i]);
     Serial.print(",");
     if (imu_data[i].valid) {
-      Serial.print(imu_data[i].acc[0], ACC_DECIMALS);
+      printFixed(imu_data[i].acc_milli[0], ACC_DECIMALS);
       Serial.print(",");
-      Serial.print(imu_data[i].acc[1], ACC_DECIMALS);
+      printFixed(imu_data[i].acc_milli[1], ACC_DECIMALS);
       Serial.print(",");
-      Serial.print(imu_data[i].acc[2], ACC_DECIMALS);
+      printFixed(imu_data[i].acc_milli[2], ACC_DECIMALS);
       if (OUTPUT_QUAT) {
         Serial.print(",");
-        Serial.print(imu_data[i].quat[0], QUAT_DECIMALS);
+        printFixed(imu_data[i].quat_raw[0], QUAT_DECIMALS);
         Serial.print(",");
-        Serial.print(imu_data[i].quat[1], QUAT_DECIMALS);
+        printFixed(imu_data[i].quat_raw[1], QUAT_DECIMALS);
         Serial.print(",");
-        Serial.print(imu_data[i].quat[2], QUAT_DECIMALS);
+        printFixed(imu_data[i].quat_raw[2], QUAT_DECIMALS);
         Serial.print(",");
-        Serial.print(imu_data[i].quat[3], QUAT_DECIMALS);
+        printFixed(imu_data[i].quat_raw[3], QUAT_DECIMALS);
       }
     } else {
+      printFixed(0, ACC_DECIMALS);
+      Serial.print(",");
+      printFixed(0, ACC_DECIMALS);
+      Serial.print(",");
+      printFixed(0, ACC_DECIMALS);
       if (OUTPUT_QUAT) {
-        Serial.print("0.000,0.000,0.000,0.0000,0.0000,0.0000,0.0000");
-      } else {
-        Serial.print("0.000,0.000,0.000");
+        Serial.print(",");
+        printFixed(0, QUAT_DECIMALS);
+        Serial.print(",");
+        printFixed(0, QUAT_DECIMALS);
+        Serial.print(",");
+        printFixed(0, QUAT_DECIMALS);
+        Serial.print(",");
+        printFixed(0, QUAT_DECIMALS);
       }
     }
   }
