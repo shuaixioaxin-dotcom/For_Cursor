@@ -25,13 +25,16 @@ const uint8_t IMU_IDS[NUM_IMUS] = {1, 2};
 
 // ================= Modbus RTU Configuration =================
 static const uint8_t MODBUS_FUNC_READ_HREG = 0x03;
-static const uint16_t MODBUS_REG_START = 0x0034;
-static const uint16_t MODBUS_REG_COUNT = 0x0016;  // 22 registers
+static const uint8_t NUM_SEGMENTS = 2;
+static const uint8_t SEG_ACC = 0;
+static const uint8_t SEG_QUAT = 1;
+static const uint16_t SEG_STARTS[NUM_SEGMENTS] = {0x0034, 0x0046};
+static const uint16_t SEG_COUNTS[NUM_SEGMENTS] = {3, 4};
+static const uint16_t MAX_SEG_REGS = 4;
 static const uint8_t MODBUS_REQUEST_LEN = 8;
-static const uint16_t RESPONSE_BYTE_COUNT = MODBUS_REG_COUNT * 2;
-static const uint16_t RESPONSE_LEN = 1 + 1 + 1 + RESPONSE_BYTE_COUNT + 2;
+static const uint16_t MAX_RESPONSE_LEN = 1 + 1 + 1 + (MAX_SEG_REGS * 2) + 2;
 static const uint16_t RESPONSE_TIMEOUT_MS = 20;
-static const uint32_t BUS_SILENCE_US = 300;
+static const uint32_t BUS_SILENCE_US = (35000000UL + RS485_BAUD - 1) / RS485_BAUD;
 static const uint32_t TX_ENABLE_DELAY_US = 30;
 static const uint32_t TX_DISABLE_DELAY_US = 60;
 static const uint32_t INTER_BYTE_TIMEOUT_US = 1500;
@@ -39,6 +42,9 @@ static const uint32_t RETRY_DELAY_MS = 2;
 static const uint32_t FAIL_COOLDOWN_MS = 10;
 static const uint8_t MAX_BACKOFF_SHIFT = 4;
 static const uint8_t MAX_RETRIES = 1;
+static const bool CHAIN_REQUESTS = true;
+static const bool USE_TX_FLUSH = false;
+static const uint8_t SEGMENT_MASK_ALL = (1 << NUM_SEGMENTS) - 1;
 
 // ================= Data Conversion =================
 static const int32_t ACC_SCALE_NUM = 48828;
@@ -58,12 +64,15 @@ ImuData imu_data[NUM_IMUS];
 uint32_t imu_next_allowed_ms[NUM_IMUS];
 uint8_t imu_fail_streak[NUM_IMUS];
 uint8_t imu_retry_left[NUM_IMUS];
-uint8_t request_frames[NUM_IMUS][MODBUS_REQUEST_LEN];
+uint8_t request_frames[NUM_IMUS][NUM_SEGMENTS][MODBUS_REQUEST_LEN];
+uint8_t imu_segment_done[NUM_IMUS];
+uint8_t imu_segment_ok[NUM_IMUS];
 
 static uint8_t current_imu_index = 0;
+static uint8_t current_segment_index = 0;
 static bool waiting_response = false;
 static uint32_t request_start_ms = 0;
-static uint8_t response_buf[RESPONSE_LEN];
+static uint8_t response_buf[MAX_RESPONSE_LEN];
 static uint16_t response_pos = 0;
 
 static uint32_t cycle_count = 0;
@@ -202,38 +211,48 @@ static void appendFixed(char *buf, size_t &len, int32_t value, uint8_t decimals)
   }
 }
 
-static void buildRequest(uint8_t slave_id, uint8_t *out) {
+static void buildRequest(uint8_t slave_id, uint16_t start_reg, uint16_t reg_count, uint8_t *out) {
   out[0] = slave_id;
   out[1] = MODBUS_FUNC_READ_HREG;
-  out[2] = (MODBUS_REG_START >> 8) & 0xFF;
-  out[3] = MODBUS_REG_START & 0xFF;
-  out[4] = (MODBUS_REG_COUNT >> 8) & 0xFF;
-  out[5] = MODBUS_REG_COUNT & 0xFF;
+  out[2] = (start_reg >> 8) & 0xFF;
+  out[3] = start_reg & 0xFF;
+  out[4] = (reg_count >> 8) & 0xFF;
+  out[5] = reg_count & 0xFF;
   uint16_t crc = crc16_modbus(out, 6);
   out[6] = crc & 0xFF;
   out[7] = (crc >> 8) & 0xFF;
 }
 
-static void sendRequest(uint8_t imu_index) {
+static void sendRequest(uint8_t imu_index, uint8_t segment_index) {
   clearRxBuffer();
   digitalWrite(RS485_DE_RE_PIN, HIGH);
   delayMicroseconds(TX_ENABLE_DELAY_US);
-  Serial2.write(request_frames[imu_index], MODBUS_REQUEST_LEN);
-  Serial2.flush();
+  Serial2.write(request_frames[imu_index][segment_index], MODBUS_REQUEST_LEN);
+  if (USE_TX_FLUSH) {
+    Serial2.flush();
+  } else {
+    uint32_t tx_time_us =
+        (static_cast<uint32_t>(MODBUS_REQUEST_LEN) * 10UL * 1000000UL + RS485_BAUD - 1) /
+        RS485_BAUD;
+    delayMicroseconds(tx_time_us);
+  }
   delayMicroseconds(TX_DISABLE_DELAY_US);
   digitalWrite(RS485_DE_RE_PIN, LOW);
   last_bus_activity_us = micros();
   last_byte_us = 0;
 }
 
-static bool parseResponse(uint8_t slave_id, const uint8_t *buf, size_t len, ImuData &out) {
-  if (len != RESPONSE_LEN) {
+static bool parseResponse(uint8_t slave_id, uint8_t segment_index, const uint8_t *buf, size_t len,
+                          ImuData &out) {
+  uint16_t expected_len = 5 + (SEG_COUNTS[segment_index] * 2);
+  uint8_t expected_byte_count = static_cast<uint8_t>(SEG_COUNTS[segment_index] * 2);
+  if (len != expected_len) {
     return false;
   }
   if (buf[0] != slave_id || buf[1] != MODBUS_FUNC_READ_HREG) {
     return false;
   }
-  if (buf[2] != RESPONSE_BYTE_COUNT) {
+  if (buf[2] != expected_byte_count) {
     return false;
   }
 
@@ -245,36 +264,34 @@ static bool parseResponse(uint8_t slave_id, const uint8_t *buf, size_t len, ImuD
   }
 
   const size_t data_start = 3;
-  int16_t ax = static_cast<int16_t>((buf[data_start] << 8) | buf[data_start + 1]);
-  int16_t ay = static_cast<int16_t>((buf[data_start + 2] << 8) | buf[data_start + 3]);
-  int16_t az = static_cast<int16_t>((buf[data_start + 4] << 8) | buf[data_start + 5]);
-
-  out.acc_milli[0] = scaleAccMilli(ax);
-  out.acc_milli[1] = scaleAccMilli(ay);
-  out.acc_milli[2] = scaleAccMilli(az);
-
-  if (buf[2] < 8) {
-    out.quat_raw[0] = 0;
-    out.quat_raw[1] = 0;
-    out.quat_raw[2] = 0;
-    out.quat_raw[3] = 0;
-  } else {
-    size_t quat_offset = data_start + (buf[2] - 8);
-    if (quat_offset + 8 > len - 2) {
+  if (segment_index == SEG_ACC) {
+    if (SEG_COUNTS[segment_index] < 3) {
       return false;
     }
-    int16_t qw = static_cast<int16_t>((buf[quat_offset] << 8) | buf[quat_offset + 1]);
-    int16_t qx = static_cast<int16_t>((buf[quat_offset + 2] << 8) | buf[quat_offset + 3]);
-    int16_t qy = static_cast<int16_t>((buf[quat_offset + 4] << 8) | buf[quat_offset + 5]);
-    int16_t qz = static_cast<int16_t>((buf[quat_offset + 6] << 8) | buf[quat_offset + 7]);
+    int16_t ax = static_cast<int16_t>((buf[data_start] << 8) | buf[data_start + 1]);
+    int16_t ay = static_cast<int16_t>((buf[data_start + 2] << 8) | buf[data_start + 3]);
+    int16_t az = static_cast<int16_t>((buf[data_start + 4] << 8) | buf[data_start + 5]);
+
+    out.acc_milli[0] = scaleAccMilli(ax);
+    out.acc_milli[1] = scaleAccMilli(ay);
+    out.acc_milli[2] = scaleAccMilli(az);
+  } else if (segment_index == SEG_QUAT) {
+    if (SEG_COUNTS[segment_index] < 4) {
+      return false;
+    }
+    int16_t qw = static_cast<int16_t>((buf[data_start] << 8) | buf[data_start + 1]);
+    int16_t qx = static_cast<int16_t>((buf[data_start + 2] << 8) | buf[data_start + 3]);
+    int16_t qy = static_cast<int16_t>((buf[data_start + 4] << 8) | buf[data_start + 5]);
+    int16_t qz = static_cast<int16_t>((buf[data_start + 6] << 8) | buf[data_start + 7]);
 
     out.quat_raw[0] = qw;
     out.quat_raw[1] = qx;
     out.quat_raw[2] = qy;
     out.quat_raw[3] = qz;
+  } else {
+    return false;
   }
 
-  out.valid = true;
   out.last_update_ms = millis();
   return true;
 }
@@ -368,15 +385,34 @@ static void reportFrequency() {
   freq_start_ms = millis();
 }
 
-static void advanceImuIndex() {
-  current_imu_index++;
-  if (current_imu_index >= NUM_IMUS) {
-    current_imu_index = 0;
-    cycle_count++;
-    if (freq_start_ms == 0) {
-      freq_start_ms = millis();
+static void finalizeSegment(bool ok) {
+  uint8_t bit = static_cast<uint8_t>(1U << current_segment_index);
+  imu_segment_done[current_imu_index] |= bit;
+  if (ok) {
+    imu_segment_ok[current_imu_index] |= bit;
+  }
+
+  if (imu_segment_done[current_imu_index] == SEGMENT_MASK_ALL) {
+    imu_data[current_imu_index].valid =
+        (imu_segment_ok[current_imu_index] == SEGMENT_MASK_ALL);
+    imu_segment_done[current_imu_index] = 0;
+    imu_segment_ok[current_imu_index] = 0;
+
+    current_segment_index = 0;
+    current_imu_index++;
+    if (current_imu_index >= NUM_IMUS) {
+      current_imu_index = 0;
+      cycle_count++;
+      if (freq_start_ms == 0) {
+        freq_start_ms = millis();
+      }
+      outputCycleCsv();
     }
-    outputCycleCsv();
+  } else {
+    current_segment_index++;
+    if (current_segment_index >= NUM_SEGMENTS) {
+      current_segment_index = 0;
+    }
   }
 }
 
@@ -385,6 +421,7 @@ static bool pickNextImu(uint32_t now_ms) {
     uint8_t idx = (current_imu_index + offset) % NUM_IMUS;
     if (now_ms >= imu_next_allowed_ms[idx]) {
       current_imu_index = idx;
+      current_segment_index = 0;
       return true;
     }
   }
@@ -407,7 +444,11 @@ void setup() {
     imu_next_allowed_ms[i] = 0;
     imu_fail_streak[i] = 0;
     imu_retry_left[i] = MAX_RETRIES;
-    buildRequest(IMU_IDS[i], request_frames[i]);
+    imu_segment_done[i] = 0;
+    imu_segment_ok[i] = 0;
+    for (uint8_t s = 0; s < NUM_SEGMENTS; ++s) {
+      buildRequest(IMU_IDS[i], SEG_STARTS[s], SEG_COUNTS[s], request_frames[i][s]);
+    }
   }
 
   Serial.println("# Modbus RTU raw read enabled");
@@ -431,15 +472,25 @@ void setup() {
 void loop() {
   if (!waiting_response) {
     uint32_t now_ms = millis();
-    if (busIsIdle() && pickNextImu(now_ms)) {
-      response_pos = 0;
-      sendRequest(current_imu_index);
-      waiting_response = true;
-      request_start_ms = millis();
+    if (busIsIdle()) {
+      if (now_ms >= imu_next_allowed_ms[current_imu_index]) {
+        response_pos = 0;
+        sendRequest(current_imu_index, current_segment_index);
+        waiting_response = true;
+        request_start_ms = now_ms;
+      } else if (current_segment_index == 0 && pickNextImu(now_ms)) {
+        response_pos = 0;
+        sendRequest(current_imu_index, current_segment_index);
+        waiting_response = true;
+        request_start_ms = now_ms;
+      }
     }
   }
 
-  while (waiting_response && Serial2.available() > 0 && response_pos < RESPONSE_LEN) {
+  uint16_t expected_len = 1 + 1 + 1 + (SEG_COUNTS[current_segment_index] * 2) + 2;
+  uint8_t expected_byte_count =
+      static_cast<uint8_t>(SEG_COUNTS[current_segment_index] * 2);
+  while (waiting_response && Serial2.available() > 0 && response_pos < expected_len) {
     int incoming = Serial2.read();
     if (incoming < 0) {
       break;
@@ -454,7 +505,7 @@ void loop() {
       response_pos = 0;
       continue;
     }
-    if (response_pos == 2 && byte_in != RESPONSE_BYTE_COUNT) {
+    if (response_pos == 2 && byte_in != expected_byte_count) {
       response_pos = 0;
       continue;
     }
@@ -462,38 +513,39 @@ void loop() {
   }
 
   if (waiting_response) {
-    if (response_pos >= RESPONSE_LEN) {
-      bool ok = parseResponse(IMU_IDS[current_imu_index], response_buf, response_pos,
-                              imu_data[current_imu_index]);
+    if (response_pos >= expected_len) {
+      bool ok = parseResponse(IMU_IDS[current_imu_index], current_segment_index, response_buf,
+                              response_pos, imu_data[current_imu_index]);
       if (ok) {
         success_count++;
         recordSuccess(current_imu_index);
+        finalizeSegment(true);
       } else {
         fail_count++;
-        zeroImu(imu_data[current_imu_index]);
         clearRxBuffer();
         last_bus_activity_us = micros();
-        scheduleRetry(current_imu_index);
+        if (!scheduleRetry(current_imu_index)) {
+          finalizeSegment(false);
+        }
       }
       waiting_response = false;
-      advanceImuIndex();
     } else if (response_pos > 0 && last_byte_us > 0 &&
                (micros() - last_byte_us > INTER_BYTE_TIMEOUT_US)) {
       fail_count++;
-      zeroImu(imu_data[current_imu_index]);
       clearRxBuffer();
       last_bus_activity_us = micros();
-      scheduleRetry(current_imu_index);
+      if (!scheduleRetry(current_imu_index)) {
+        finalizeSegment(false);
+      }
       waiting_response = false;
-      advanceImuIndex();
     } else if (millis() - request_start_ms > RESPONSE_TIMEOUT_MS) {
       fail_count++;
-      zeroImu(imu_data[current_imu_index]);
       clearRxBuffer();
       last_bus_activity_us = micros();
-      scheduleRetry(current_imu_index);
+      if (!scheduleRetry(current_imu_index)) {
+        finalizeSegment(false);
+      }
       waiting_response = false;
-      advanceImuIndex();
     }
   }
 
