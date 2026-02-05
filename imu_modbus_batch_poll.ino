@@ -33,11 +33,8 @@ static const uint32_t TX_DISABLE_HOLD_US = 6;
 // 切换到接收后，给收发器一点点稳定时间
 static const uint32_t RX_SETTLE_US = 2;
 
-// 两段式读超时：
-// - 首字节等待：若从机完全不响应，尽快跳过（提升整体频率）
-// - 总时长：从机开始响应后，留足时间读完整帧
-static const uint32_t FIRST_BYTE_TIMEOUT_US = 800;
-static const uint32_t FRAME_TOTAL_TIMEOUT_US = 3000;
+// 读响应的总超时：49字节@921600约0.53ms，这里留余量用于从机处理时间/抖动
+static const uint32_t FRAME_TOTAL_TIMEOUT_US = 4000;
 
 // 如果你仍想用 readBytes，可启用该超时（当前实现已不用 readBytes）
 static const uint16_t SERIAL2_READ_TIMEOUT_MS = 3;
@@ -109,35 +106,52 @@ static void waitBusSilence() {
   }
 }
 
-static size_t readFrameTwoStage(uint8_t *buf, size_t want_len) {
+// 关键：为抗“回显/粘包/错位”，必须先同步到响应头 (id, func, byteCount) 再收满帧
+static size_t readResponseFrame(uint8_t slave_id, uint8_t *buf, size_t want_len) {
   uint32_t start = micros();
   size_t pos = 0;
 
-  // 1) 等首字节（快速判断是否有响应）
-  while ((micros() - start) < FIRST_BYTE_TIMEOUT_US) {
-    if (Serial2.available() > 0) {
-      int c = Serial2.read();
-      if (c >= 0) {
-        buf[pos++] = static_cast<uint8_t>(c);
-        last_bus_activity_us = micros();
-        break;
-      }
+  while ((micros() - start) < FRAME_TOTAL_TIMEOUT_US) {
+    if (Serial2.available() <= 0) {
+      continue;
     }
-  }
-  if (pos == 0) {
-    return 0;
+    int c = Serial2.read();
+    if (c < 0) {
+      continue;
+    }
+    last_bus_activity_us = micros();
+    uint8_t b = static_cast<uint8_t>(c);
+
+    if (pos == 0) {
+      if (b != slave_id) {
+        continue;
+      }
+      buf[pos++] = b;
+      continue;
+    }
+    if (pos == 1) {
+      if (b != MODBUS_FUNC_READ_HREG) {
+        pos = 0;
+        continue;
+      }
+      buf[pos++] = b;
+      continue;
+    }
+    if (pos == 2) {
+      if (b != RESPONSE_BYTE_COUNT) {
+        pos = 0;
+        continue;
+      }
+      buf[pos++] = b;
+      continue;
+    }
+
+    buf[pos++] = b;
+    if (pos >= want_len) {
+      return pos;
+    }
   }
 
-  // 2) 继续读满整帧（总时长限制）
-  while (pos < want_len && (micros() - start) < FRAME_TOTAL_TIMEOUT_US) {
-    if (Serial2.available() > 0) {
-      int c = Serial2.read();
-      if (c >= 0) {
-        buf[pos++] = static_cast<uint8_t>(c);
-        last_bus_activity_us = micros();
-      }
-    }
-  }
   return pos;
 }
 
@@ -274,7 +288,7 @@ static void reportFrequency() {
     Serial.print(fail_per_imu[i]);
   }
   Serial.print("]");
-  Serial.println(")");
+  Serial.println();
 
   cycle_count = 0;
   success_count = 0;
@@ -310,9 +324,9 @@ static void doBatchProcessing() {
     }
     last_bus_activity_us = micros();
 
-    // 2) 等待并读取响应：两段式超时（先等首字节，再读满整帧）
+    // 2) 等待并读取响应：同步响应头后读取整帧（抗回显/错位）
     uint8_t response[RESPONSE_LEN];
-    size_t len = readFrameTwoStage(response, RESPONSE_LEN);
+    size_t len = readResponseFrame(IMU_IDS[i], response, RESPONSE_LEN);
 
     if (len == RESPONSE_LEN && response[0] == IMU_IDS[i] && response[1] == MODBUS_FUNC_READ_HREG) {
       bool ok = parseResponse(IMU_IDS[i], response, len, imu_data[i]);
