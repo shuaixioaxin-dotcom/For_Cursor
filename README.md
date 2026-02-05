@@ -7,6 +7,7 @@
 | 文档 | 说明 | 适合人群 |
 |------|------|----------|
 | **[QUICK_START.md](QUICK_START.md)** | 3步骤快速上手，1分钟开始使用 | ⭐ 所有用户（首先阅读）|
+| **[COMPARISON_CHART.md](COMPARISON_CHART.md)** | 性能对比图表和可视化数据 | 想直观了解优化效果 |
 | **[README.md](README.md)** (本文档) | 完整的优化方案说明和对比 | 想了解详细原理的用户 |
 | **[TUNING_GUIDE.md](TUNING_GUIDE.md)** | 逐步调优指南，根据硬件精细调整 | 需要定制化优化的用户 |
 | **[imu_optimization_analysis.md](imu_optimization_analysis.md)** | 性能瓶颈分析和理论计算 | 技术研究者 |
