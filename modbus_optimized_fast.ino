@@ -30,9 +30,10 @@ static const uint16_t QUAT_RESPONSE_LEN = 1 + 1 + 1 + QUAT_RESPONSE_BYTE_COUNT +
 
 static const uint8_t MODBUS_REQUEST_LEN = 8;
 static const uint16_t RESPONSE_TIMEOUT_MS = 30;
-static const uint32_t BUS_SILENCE_US = 400;  // 减少总线静默时间
-static const uint32_t TX_ENABLE_DELAY_US = 20;  // 减少延迟
-static const uint32_t TX_DISABLE_DELAY_US = 40;  // 减少延迟
+static const uint32_t BUS_SILENCE_US = 500;  // 恢复总线静默时间
+static const uint32_t TX_ENABLE_DELAY_US = 30;  // 恢复延迟
+static const uint32_t TX_DISABLE_DELAY_US = 60;  // 恢复延迟
+static const uint8_t MAX_CONSECUTIVE_FAILS = 3;  // 最大连续失败次数
 
 // ================= Data Conversion =================
 static const float ACC_SCALE = 0.0048828f;
@@ -73,6 +74,10 @@ static float temp_acc[3];
 static float temp_quat[4];
 static bool temp_acc_valid = false;
 
+// 失败计数
+static uint8_t imu_consecutive_fails[NUM_IMUS];
+static uint32_t imu_skip_until_ms[NUM_IMUS];
+
 // ================= Utility =================
 static inline uint16_t crc16_modbus(const uint8_t *data, size_t len) {
   uint16_t crc = 0xFFFF;
@@ -100,6 +105,25 @@ static inline bool busIsIdle() {
     return true;
   }
   return (micros() - last_bus_activity_us) >= BUS_SILENCE_US;
+}
+
+static inline void recordImuSuccess(uint8_t idx) {
+  imu_consecutive_fails[idx] = 0;
+  imu_skip_until_ms[idx] = 0;
+}
+
+static inline void recordImuFailure(uint8_t idx) {
+  imu_consecutive_fails[idx]++;
+  if (imu_consecutive_fails[idx] >= MAX_CONSECUTIVE_FAILS) {
+    // 跳过该IMU 10ms
+    imu_skip_until_ms[idx] = millis() + 10;
+    imu_consecutive_fails[idx] = 0;
+  }
+}
+
+static inline bool canReadImu(uint8_t idx) {
+  uint32_t now = millis();
+  return now >= imu_skip_until_ms[idx];
 }
 
 static void buildRequest(uint8_t slave_id, uint16_t reg_start, uint16_t reg_count, uint8_t *out) {
@@ -248,6 +272,8 @@ void setup() {
 
   for (uint8_t i = 0; i < NUM_IMUS; ++i) {
     imu_data[i].valid = false;
+    imu_consecutive_fails[i] = 0;
+    imu_skip_until_ms[i] = 0;
   }
 
   Serial.println("# Modbus 优化读取 - 高性能版本");
@@ -266,8 +292,15 @@ void loop() {
       waiting_response = true;
       request_start_ms = millis();
     }
-    // 否则，开始读取下一个 IMU 的 ACC
+    // 否则，开始读取下一个 IMU 的 ACC（如果该IMU未被跳过）
     else if (current_read_state == READ_ACC && busIsIdle()) {
+      // 检查当前IMU是否可读
+      if (!canReadImu(current_imu_index)) {
+        // 跳过当前IMU，切换到下一个
+        advanceImuIndex();
+        return;
+      }
+      
       response_pos = 0;
       sendRequest(IMU_IDS[current_imu_index], MODBUS_REG_ACC_START, MODBUS_REG_ACC_COUNT);
       expected_response_len = ACC_RESPONSE_LEN;
@@ -315,6 +348,7 @@ void loop() {
         } else {
           temp_acc_valid = false;
           imu_data[current_imu_index].valid = false;
+          recordImuFailure(current_imu_index);
           current_read_state = READ_ACC;
           advanceImuIndex();
         }
@@ -331,8 +365,10 @@ void loop() {
           imu_data[current_imu_index].quat[2] = temp_quat[2];
           imu_data[current_imu_index].quat[3] = temp_quat[3];
           imu_data[current_imu_index].valid = true;
+          recordImuSuccess(current_imu_index);
         } else {
           imu_data[current_imu_index].valid = false;
+          recordImuFailure(current_imu_index);
         }
         
         current_read_state = READ_ACC;
@@ -344,6 +380,7 @@ void loop() {
     } else if (millis() - request_start_ms > RESPONSE_TIMEOUT_MS) {
       // 超时处理
       imu_data[current_imu_index].valid = false;
+      recordImuFailure(current_imu_index);
       clearRxBuffer();
       last_bus_activity_us = micros();
       waiting_response = false;
