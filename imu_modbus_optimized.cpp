@@ -25,8 +25,15 @@ static const uint16_t RESPONSE_LEN = 1 + 1 + 1 + RESPONSE_BYTE_COUNT + 2;  // 49
 // 超时设置：根据波特率计算
 // 921600 baud, 10 bits/byte => ~11us/byte
 // 49 bytes response => ~539us minimum
-// 设置 5ms 超时，留足够余量
-static const uint16_t RESPONSE_TIMEOUT_MS = 5;
+// 设置 15ms 超时，留足够余量给IMU处理时间
+static const uint16_t RESPONSE_TIMEOUT_MS = 15;
+
+// RS485 收发器切换延迟 (微秒)
+static const uint32_t TX_SWITCH_DELAY_US = 50;
+
+// 请求之间的总线静默时间 (微秒)
+// 给总线和设备一些恢复时间
+static const uint32_t BUS_SILENCE_US = 200;
 
 // ================= Data Conversion =================
 static const float ACC_SCALE = 0.0048828f;
@@ -217,11 +224,18 @@ static void reportFrequency() {
  */
 void doBatchProcessing() {
   for (int i = 0; i < NUM_IMUS; i++) {
+    // 0. 清空接收缓冲区，确保干净的起始状态
+    while (Serial2.available()) {
+      Serial2.read();
+    }
+
     // 1. 发送请求
     digitalWrite(RS485_DE_RE_PIN, HIGH);
+    delayMicroseconds(TX_SWITCH_DELAY_US);  // 等待收发器切换到发送模式
     Serial2.write(request_frames[i], MODBUS_REQUEST_LEN);
     Serial2.flush();  // 确保数据完全发出
-    digitalWrite(RS485_DE_RE_PIN, LOW);  // 立即切换到接收模式
+    delayMicroseconds(TX_SWITCH_DELAY_US);  // 等待最后一个字节发送完成
+    digitalWrite(RS485_DE_RE_PIN, LOW);  // 切换到接收模式
 
     // 2. 等待并读取响应
     uint8_t response[RESPONSE_LEN];
@@ -249,6 +263,9 @@ void doBatchProcessing() {
         Serial2.read();
       }
     }
+
+    // 4. 请求之间的总线静默时间
+    delayMicroseconds(BUS_SILENCE_US);
   }
 
   // 4. 更新统计
@@ -291,7 +308,11 @@ void setup() {
   Serial.println();
   Serial.print("# Response timeout: ");
   Serial.print(RESPONSE_TIMEOUT_MS);
-  Serial.println(" ms");
+  Serial.print(" ms, TX delay: ");
+  Serial.print(TX_SWITCH_DELAY_US);
+  Serial.print(" us, Bus silence: ");
+  Serial.print(BUS_SILENCE_US);
+  Serial.println(" us");
   Serial.println("# CSV order: id,accx,accy,accz,qw,qx,qy,qz (repeat)");
 
   last_freq_report_ms = millis();
