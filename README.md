@@ -2,6 +2,24 @@
 
 本项目提供了两个优化版本的Arduino代码，用于将IMU数据读取频率提升到200Hz或更高。
 
+## 📚 文档导航
+
+| 文档 | 说明 | 适合人群 |
+|------|------|----------|
+| **[QUICK_START.md](QUICK_START.md)** | 3步骤快速上手，1分钟开始使用 | ⭐ 所有用户（首先阅读）|
+| **[README.md](README.md)** (本文档) | 完整的优化方案说明和对比 | 想了解详细原理的用户 |
+| **[TUNING_GUIDE.md](TUNING_GUIDE.md)** | 逐步调优指南，根据硬件精细调整 | 需要定制化优化的用户 |
+| **[imu_optimization_analysis.md](imu_optimization_analysis.md)** | 性能瓶颈分析和理论计算 | 技术研究者 |
+
+## 💾 代码文件
+
+| 文件 | 目标频率 | 难度 | 推荐度 |
+|------|----------|------|--------|
+| **imu_optimized_conservative.ino** | 200-300Hz | ✅ 简单 | ⭐⭐⭐⭐⭐ |
+| **imu_optimized_aggressive.ino** | 400-800Hz | ⚠️ 需硬件支持 | ⭐⭐⭐ |
+
+---
+
 ## 📊 优化方案对比
 
 | 优化项目 | 原版本 | 保守版 | 激进版 |
