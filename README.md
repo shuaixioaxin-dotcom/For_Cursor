@@ -32,4 +32,11 @@ For testing of Cursor
 2. 打开串口监视器（2000000波特率）
 3. 观察统计输出中的重试成功率和错误率
 
-详细说明请查看 `OPTIMIZATION_GUIDE.md`。 
+### 完整文档
+- **[INDEX.md](INDEX.md)** - 📚 文档索引与导航（推荐从这里开始）
+- **[OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md)** - 优化指南（必读）
+- **[TESTING_CHECKLIST.md](TESTING_CHECKLIST.md)** - 测试清单（部署必备）
+- **[TUNING_REFERENCE.md](TUNING_REFERENCE.md)** - 调优参考（实用工具）
+- **[PARAMETER_COMPARISON.md](PARAMETER_COMPARISON.md)** - 参数对比分析
+- **[HARDWARE_TROUBLESHOOTING.md](HARDWARE_TROUBLESHOOTING.md)** - 硬件故障排查
+- **[CHANGES_SUMMARY.md](CHANGES_SUMMARY.md)** - 变更摘要 
