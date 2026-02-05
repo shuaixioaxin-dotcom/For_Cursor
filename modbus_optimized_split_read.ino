@@ -33,8 +33,8 @@ static const uint16_t RESPONSE_TIMEOUT_MS = 30;
 static const uint32_t BUS_SILENCE_US = 500;
 static const uint32_t TX_ENABLE_DELAY_US = 30;
 static const uint32_t TX_DISABLE_DELAY_US = 60;
-static const uint32_t FAIL_COOLDOWN_MS = 20;
-static const uint8_t MAX_BACKOFF_SHIFT = 4;
+static const uint32_t FAIL_COOLDOWN_MS = 5;  // 减少基础冷却时间
+static const uint8_t MAX_BACKOFF_SHIFT = 2;  // 减少最大退避等级
 
 // ================= Data Conversion =================
 static const float ACC_SCALE = 0.0048828f;
@@ -42,6 +42,22 @@ static const float QUAT_SCALE = 0.0001f;
 
 // ================= Frequency Monitoring =================
 static const uint32_t FREQ_REPORT_INTERVAL_MS = 1000;
+
+// ================= Debug Configuration =================
+#define DEBUG_ENABLED 1  // 设置为 0 关闭调试信息
+
+// 每个 IMU 的统计信息
+struct ImuStats {
+  uint32_t acc_success;
+  uint32_t acc_fail;
+  uint32_t quat_success;
+  uint32_t quat_fail;
+  uint32_t acc_timeout;
+  uint32_t quat_timeout;
+  uint32_t total_reads;
+};
+
+ImuStats imu_stats[NUM_IMUS];
 
 // ================= Read State Machine =================
 enum ReadState {
@@ -151,6 +167,22 @@ static void buildRequest(uint8_t slave_id, uint16_t reg_start, uint16_t reg_coun
 static void sendRequest(uint8_t slave_id, uint16_t reg_start, uint16_t reg_count) {
   uint8_t request[MODBUS_REQUEST_LEN];
   buildRequest(slave_id, reg_start, reg_count, request);
+
+#if DEBUG_ENABLED
+  Serial.print("# [TX] ID=");
+  Serial.print(slave_id);
+  Serial.print(" Reg=0x");
+  Serial.print(reg_start, HEX);
+  Serial.print(" Count=");
+  Serial.print(reg_count);
+  Serial.print(" Data: ");
+  for (uint8_t i = 0; i < MODBUS_REQUEST_LEN; i++) {
+    if (request[i] < 0x10) Serial.print("0");
+    Serial.print(request[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+#endif
 
   clearRxBuffer();
   digitalWrite(RS485_DE_RE_PIN, HIGH);
@@ -273,6 +305,34 @@ static void reportFrequency() {
   Serial.print(fail_count);
   Serial.println(")");
 
+#if DEBUG_ENABLED
+  // 显示每个 IMU 的详细统计
+  for (uint8_t i = 0; i < NUM_IMUS; ++i) {
+    Serial.print("# [IMU");
+    Serial.print(IMU_IDS[i]);
+    Serial.print("] ACC: 成功=");
+    Serial.print(imu_stats[i].acc_success);
+    Serial.print(" 失败=");
+    Serial.print(imu_stats[i].acc_fail);
+    Serial.print(" 超时=");
+    Serial.print(imu_stats[i].acc_timeout);
+    Serial.print(" | QUAT: 成功=");
+    Serial.print(imu_stats[i].quat_success);
+    Serial.print(" 失败=");
+    Serial.print(imu_stats[i].quat_fail);
+    Serial.print(" 超时=");
+    Serial.print(imu_stats[i].quat_timeout);
+    Serial.print(" | 退避等级=");
+    Serial.print(imu_fail_streak[i]);
+    if (imu_next_allowed_ms[i] > millis()) {
+      Serial.print(" 冷却剩余=");
+      Serial.print(imu_next_allowed_ms[i] - millis());
+      Serial.print("ms");
+    }
+    Serial.println();
+  }
+#endif
+
   cycle_count = 0;
   success_count = 0;
   fail_count = 0;
@@ -313,6 +373,13 @@ void setup() {
     zeroImu(imu_data[i]);
     imu_next_allowed_ms[i] = 0;
     imu_fail_streak[i] = 0;
+    imu_stats[i].acc_success = 0;
+    imu_stats[i].acc_fail = 0;
+    imu_stats[i].quat_success = 0;
+    imu_stats[i].quat_fail = 0;
+    imu_stats[i].acc_timeout = 0;
+    imu_stats[i].quat_timeout = 0;
+    imu_stats[i].total_reads = 0;
   }
 
   Serial.println("# Modbus RTU 优化读取模式（分离ACC和QUAT）");
@@ -334,22 +401,28 @@ void setup() {
 void loop() {
   if (!waiting_response) {
     uint32_t now_ms = millis();
-    if (busIsIdle() && pickNextImu(now_ms)) {
-      response_pos = 0;
-      
-      // 根据当前状态发送不同的请求
-      if (current_read_state == READ_ACC) {
-        sendRequest(IMU_IDS[current_imu_index], MODBUS_REG_ACC_START, MODBUS_REG_ACC_COUNT);
-        expected_response_len = ACC_RESPONSE_LEN;
-        temp_acc_valid = false;
-      } else if (current_read_state == READ_QUAT) {
+    
+    // 如果当前状态是 READ_QUAT，说明刚刚读取完 ACC，继续读取同一个 IMU 的 QUAT
+    if (current_read_state == READ_QUAT) {
+      if (busIsIdle()) {
+        response_pos = 0;
         sendRequest(IMU_IDS[current_imu_index], MODBUS_REG_QUAT_START, MODBUS_REG_QUAT_COUNT);
         expected_response_len = QUAT_RESPONSE_LEN;
         temp_quat_valid = false;
+        waiting_response = true;
+        request_start_ms = millis();
       }
-      
-      waiting_response = true;
-      request_start_ms = millis();
+    }
+    // 否则，选择下一个 IMU 并开始读取 ACC
+    else if (current_read_state == READ_ACC) {
+      if (busIsIdle() && pickNextImu(now_ms)) {
+        response_pos = 0;
+        sendRequest(IMU_IDS[current_imu_index], MODBUS_REG_ACC_START, MODBUS_REG_ACC_COUNT);
+        expected_response_len = ACC_RESPONSE_LEN;
+        temp_acc_valid = false;
+        waiting_response = true;
+        request_start_ms = millis();
+      }
     }
   }
 
@@ -387,26 +460,63 @@ void loop() {
   if (waiting_response) {
     if (response_pos >= expected_response_len) {
       bool ok = false;
+
+#if DEBUG_ENABLED
+      // 显示接收到的完整数据
+      Serial.print("# [RX] 长度=");
+      Serial.print(response_pos);
+      Serial.print(" Data: ");
+      for (uint16_t i = 0; i < response_pos; i++) {
+        if (response_buf[i] < 0x10) Serial.print("0");
+        Serial.print(response_buf[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+#endif
       
       if (current_read_state == READ_ACC) {
         ok = parseAccResponse(IMU_IDS[current_imu_index], response_buf, response_pos, temp_acc);
         if (ok) {
           temp_acc_valid = true;
+          imu_stats[current_imu_index].acc_success++;
           current_read_state = READ_QUAT;  // 继续读取QUAT
+#if DEBUG_ENABLED
+          Serial.print("# [DEBUG] IMU");
+          Serial.print(IMU_IDS[current_imu_index]);
+          Serial.println(" ACC 读取成功");
+#endif
         } else {
           fail_count++;
           temp_acc_valid = false;
+          imu_stats[current_imu_index].acc_fail++;
           zeroImu(imu_data[current_imu_index]);
           recordFailure(current_imu_index);
           current_read_state = READ_ACC;  // 重置到ACC状态
+#if DEBUG_ENABLED
+          Serial.print("# [DEBUG] IMU");
+          Serial.print(IMU_IDS[current_imu_index]);
+          Serial.println(" ACC 读取失败");
+#endif
           advanceImuIndex();
         }
       } else if (current_read_state == READ_QUAT) {
         ok = parseQuatResponse(IMU_IDS[current_imu_index], response_buf, response_pos, temp_quat);
         if (ok) {
           temp_quat_valid = true;
+          imu_stats[current_imu_index].quat_success++;
+#if DEBUG_ENABLED
+          Serial.print("# [DEBUG] IMU");
+          Serial.print(IMU_IDS[current_imu_index]);
+          Serial.println(" QUAT 读取成功");
+#endif
         } else {
           temp_quat_valid = false;
+          imu_stats[current_imu_index].quat_fail++;
+#if DEBUG_ENABLED
+          Serial.print("# [DEBUG] IMU");
+          Serial.print(IMU_IDS[current_imu_index]);
+          Serial.println(" QUAT 读取失败");
+#endif
         }
         
         // QUAT读取完成，更新IMU数据
@@ -440,8 +550,26 @@ void loop() {
       
       if (current_read_state == READ_ACC) {
         temp_acc_valid = false;
+        imu_stats[current_imu_index].acc_timeout++;
+#if DEBUG_ENABLED
+        Serial.print("# [TIMEOUT] IMU");
+        Serial.print(IMU_IDS[current_imu_index]);
+        Serial.print(" ACC 超时，接收字节数=");
+        Serial.print(response_pos);
+        Serial.print(" 预期=");
+        Serial.println(expected_response_len);
+#endif
       } else if (current_read_state == READ_QUAT) {
         temp_quat_valid = false;
+        imu_stats[current_imu_index].quat_timeout++;
+#if DEBUG_ENABLED
+        Serial.print("# [TIMEOUT] IMU");
+        Serial.print(IMU_IDS[current_imu_index]);
+        Serial.print(" QUAT 超时，接收字节数=");
+        Serial.print(response_pos);
+        Serial.print(" 预期=");
+        Serial.println(expected_response_len);
+#endif
       }
       
       zeroImu(imu_data[current_imu_index]);
