@@ -38,6 +38,7 @@ volatile uint8_t read_buffer_idx = 1;
 volatile unsigned long cycle_count = 0;
 volatile unsigned long freq_calc_start = 0;
 constexpr uint32_t kFreqReportIntervalMs = 1000;
+constexpr uint32_t kWdtYieldEveryCycles = 500;
 
 CRGB leds[kNumLeds];
 
@@ -142,9 +143,14 @@ void taskDataAcquisition(void *parameter) {
   freq_calc_start = millis();
 
   vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+  uint32_t yield_counter = 0;
 
   while (true) {
     doBatchProcessing();
+    if (++yield_counter >= kWdtYieldEveryCycles) {
+      yield_counter = 0;
+      vTaskDelay(1);
+    }
   }
 }
 
@@ -261,9 +267,9 @@ void begin() {
     request_frames[i][7] = (crc >> 8) & 0xFF;
   }
 
-  Serial2.begin(2500000, SERIAL_8N1, kRs485RxPin, kRs485TxPin);
   Serial2.setRxBufferSize(256);
   Serial2.setTxBufferSize(256);
+  Serial2.begin(2500000, SERIAL_8N1, kRs485RxPin, kRs485TxPin);
 
   for (int i = 0; i < 2; i++) {
     encoder_data_buffer[i].all_ok = false;
