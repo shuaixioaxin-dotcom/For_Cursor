@@ -54,7 +54,7 @@ MultiEncoder::MultiEncoder(const Config& config)
         serialTxBufferSize_ = 256;
     }
     if (yieldEveryBatches_ == 0) {
-        yieldEveryBatches_ = 16;
+        yieldEveryBatches_ = 64;
     }
     if (yieldDelayTicks_ == 0) {
         yieldDelayTicks_ = 1;

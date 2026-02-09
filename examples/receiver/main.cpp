@@ -31,6 +31,7 @@ volatile uint32_t gRxCount = 0;
 volatile uint32_t gLastRxMs = 0;
 volatile int gLastLen = 0;
 uint8_t gLastMac[6] = {};
+uint8_t gLocalMac[6] = {};
 portMUX_TYPE gPacketMux = portMUX_INITIALIZER_UNLOCKED;
 
 void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
@@ -77,6 +78,18 @@ void setup() {
 
     if (!initEspNow()) {
         Serial.println("ESP-NOW init failed.");
+    }
+
+    WiFi.macAddress(gLocalMac);
+    if (kDebugSerial) {
+        Serial.printf("# Receiver MAC: %02X:%02X:%02X:%02X:%02X:%02X ch=%u\n",
+                      gLocalMac[0],
+                      gLocalMac[1],
+                      gLocalMac[2],
+                      gLocalMac[3],
+                      gLocalMac[4],
+                      gLocalMac[5],
+                      kEspNowChannel);
     }
 }
 

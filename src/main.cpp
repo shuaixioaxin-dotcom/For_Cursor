@@ -19,6 +19,7 @@ constexpr uint32_t kRs485Baudrate = 2500000;
 constexpr uint8_t kPeerMac[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
 constexpr uint8_t kEspNowChannel = 1;
 constexpr uint32_t kEspNowSendIntervalMs = 5;
+constexpr bool kDebugSerial = true;
 constexpr uint8_t kEncoderTaskCore = 1;
 constexpr UBaseType_t kEncoderTaskPriority = tskIDLE_PRIORITY + 2;
 constexpr uint8_t kSendTaskCore = 0;
@@ -36,7 +37,7 @@ MultiEncoder encoder({
     .serialRxBufferSize = 256,
     .serialTxBufferSize = 256,
     .idleDelayUs = 0,
-    .yieldEveryBatches = 16,
+    .yieldEveryBatches = 64,
     .yieldDelayTicks = 1,
 });
 
@@ -52,6 +53,20 @@ EncoderPacket packet;
 uint16_t values[MultiEncoder::kMaxEncoders];
 bool status[MultiEncoder::kMaxEncoders];
 
+volatile uint32_t gTxOkCount = 0;
+volatile uint32_t gTxFailCount = 0;
+volatile esp_err_t gLastSendErr = ESP_OK;
+uint8_t gLocalMac[6] = {};
+
+void onEspNowSend(const uint8_t* mac, esp_now_send_status_t status) {
+    (void)mac;
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        gTxOkCount++;
+    } else {
+        gTxFailCount++;
+    }
+}
+
 bool initEspNow() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
@@ -62,12 +77,16 @@ bool initEspNow() {
         return false;
     }
 
+    esp_now_register_send_cb(onEspNowSend);
+
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, kPeerMac, sizeof(kPeerMac));
     peerInfo.channel = kEspNowChannel;
     peerInfo.encrypt = false;
 
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    esp_err_t addResult = esp_now_add_peer(&peerInfo);
+    if (addResult != ESP_OK && addResult != ESP_ERR_ESPNOW_EXIST) {
+        gLastSendErr = addResult;
         return false;
     }
 
@@ -126,6 +145,25 @@ void setup() {
         return;
     }
 
+    WiFi.macAddress(gLocalMac);
+    if (kDebugSerial) {
+        Serial.printf("# Sender MAC: %02X:%02X:%02X:%02X:%02X:%02X ch=%u\n",
+                      gLocalMac[0],
+                      gLocalMac[1],
+                      gLocalMac[2],
+                      gLocalMac[3],
+                      gLocalMac[4],
+                      gLocalMac[5],
+                      kEspNowChannel);
+        Serial.printf("# Peer MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      kPeerMac[0],
+                      kPeerMac[1],
+                      kPeerMac[2],
+                      kPeerMac[3],
+                      kPeerMac[4],
+                      kPeerMac[5]);
+    }
+
     xTaskCreatePinnedToCore(
         taskEspNowSender,
         "EspNowSend",
@@ -137,5 +175,16 @@ void setup() {
 }
 
 void loop() {
+    if (kDebugSerial) {
+        static uint32_t lastReportMs = 0;
+        uint32_t now = millis();
+        if (now - lastReportMs >= 1000) {
+            lastReportMs = now;
+            Serial.printf("# ESP-NOW tx_ok=%lu tx_fail=%lu last_err=%d\n",
+                          static_cast<unsigned long>(gTxOkCount),
+                          static_cast<unsigned long>(gTxFailCount),
+                          static_cast<int>(gLastSendErr));
+        }
+    }
     vTaskDelay(portMAX_DELAY);
 }
