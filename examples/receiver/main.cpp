@@ -1,10 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <cstring>
 
 namespace {
 constexpr uint32_t kUartBaudrate = 2000000;
+constexpr uint8_t kEspNowChannel = 1;
 
 constexpr uint8_t kMaxEncoders = 32;
 constexpr uint16_t kUartMagic = 0xA55A;
@@ -42,6 +44,7 @@ bool initEspNow() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
+    esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
 
     if (esp_now_init() != ESP_OK) {
         return false;

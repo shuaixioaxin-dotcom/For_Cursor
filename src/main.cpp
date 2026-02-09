@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <cstring>
 
 #include "MultiEncoder.h"
@@ -16,7 +17,7 @@ constexpr uint32_t kRs485Baudrate = 2500000;
 
 // Update with receiver MAC address.
 constexpr uint8_t kPeerMac[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
-constexpr uint8_t kEspNowChannel = 0;
+constexpr uint8_t kEspNowChannel = 1;
 constexpr uint32_t kEspNowSendIntervalMs = 5;
 
 MultiEncoder encoder({
@@ -32,6 +33,8 @@ MultiEncoder encoder({
     .serialRxBufferSize = 256,
     .serialTxBufferSize = 256,
     .idleDelayUs = 0,
+    .yieldEveryBatches = 16,
+    .yieldDelayTicks = 1,
 });
 
 struct EncoderPacket {
@@ -50,6 +53,7 @@ bool initEspNow() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
+    esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
 
     if (esp_now_init() != ESP_OK) {
         return false;

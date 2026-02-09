@@ -19,6 +19,8 @@ public:
         uint32_t serialRxBufferSize;
         uint32_t serialTxBufferSize;
         uint32_t idleDelayUs;
+        uint32_t yieldEveryBatches;
+        uint32_t yieldDelayTicks;
     };
 
     explicit MultiEncoder(const Config& config);
@@ -68,6 +70,9 @@ private:
     uint32_t serialRxBufferSize_;
     uint32_t serialTxBufferSize_;
     uint32_t idleDelayUs_;
+    uint32_t yieldEveryBatches_;
+    uint32_t yieldDelayTicks_;
+    uint32_t batchCounter_;
 
     EncoderData buffers_[2];
     volatile uint8_t writeIdx_;

@@ -16,6 +16,9 @@ MultiEncoder::MultiEncoder(const Config& config)
       serialRxBufferSize_(config.serialRxBufferSize),
       serialTxBufferSize_(config.serialTxBufferSize),
       idleDelayUs_(config.idleDelayUs),
+      yieldEveryBatches_(config.yieldEveryBatches),
+      yieldDelayTicks_(config.yieldDelayTicks),
+      batchCounter_(0),
       writeIdx_(0),
       readIdx_(1),
       sequence_(0),
@@ -50,6 +53,12 @@ MultiEncoder::MultiEncoder(const Config& config)
     if (serialTxBufferSize_ == 0) {
         serialTxBufferSize_ = 256;
     }
+    if (yieldEveryBatches_ == 0) {
+        yieldEveryBatches_ = 16;
+    }
+    if (yieldDelayTicks_ == 0) {
+        yieldDelayTicks_ = 1;
+    }
 
     if (deRePin_ >= 0) {
         if (deRePin_ < 32) {
@@ -72,9 +81,9 @@ bool MultiEncoder::begin(HardwareSerial& serial) {
     pinMode(deRePin_, OUTPUT);
     digitalWrite(deRePin_, LOW);
 
-    serial_->begin(baudrate_, SERIAL_8N1, rxPin_, txPin_);
     serial_->setRxBufferSize(serialRxBufferSize_);
     serial_->setTxBufferSize(serialTxBufferSize_);
+    serial_->begin(baudrate_, SERIAL_8N1, rxPin_, txPin_);
 
     for (uint8_t i = 0; i < numEncoders_; ++i) {
         requestFrames_[i][0] = encoderIds_[i];
@@ -186,9 +195,14 @@ void MultiEncoder::taskTrampoline(void* arg) {
 }
 
 void MultiEncoder::taskLoop() {
-    vTaskPrioritySet(nullptr, configMAX_PRIORITIES - 1);
     while (true) {
         processBatch();
+        ++batchCounter_;
+        if (yieldEveryBatches_ > 0 && batchCounter_ >= yieldEveryBatches_) {
+            batchCounter_ = 0;
+            vTaskDelay(yieldDelayTicks_);
+            continue;
+        }
         if (idleDelayUs_ > 0) {
             delayMicroseconds(idleDelayUs_);
         }
