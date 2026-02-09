@@ -7,6 +7,7 @@
 #include "dual_core_encoder.h"
 
 #include <FastLED.h>
+#include <esp_task_wdt.h>
 #include <soc/gpio_struct.h>
 
 namespace DualCoreEncoder {
@@ -38,7 +39,7 @@ volatile uint8_t read_buffer_idx = 1;
 volatile unsigned long cycle_count = 0;
 volatile unsigned long freq_calc_start = 0;
 constexpr uint32_t kFreqReportIntervalMs = 1000;
-constexpr uint32_t kWdtYieldEveryCycles = 500;
+constexpr uint32_t kWdtYieldEveryCycles = DUAL_CORE_ENCODER_WDT_YIELD_CYCLES;
 
 CRGB leds[kNumLeds];
 
@@ -143,6 +144,9 @@ void taskDataAcquisition(void *parameter) {
   freq_calc_start = millis();
 
   vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+#if DUAL_CORE_ENCODER_WDT_DISABLE
+  esp_task_wdt_delete(NULL);
+#endif
   uint32_t yield_counter = 0;
 
   while (true) {
@@ -285,6 +289,9 @@ void begin() {
   Serial.println("# System Ready - Ultra-Fast Dual-Core Mode (2.5Mbps)");
   Serial.println(
       "# Optimizations: No flush() + Aggressive timeouts + Dual-core separation");
+#if DUAL_CORE_ENCODER_WDT_DISABLE
+  esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(0));
+#endif
 
   xTaskCreatePinnedToCore(taskDataAcquisition,
                           "DataAcq",

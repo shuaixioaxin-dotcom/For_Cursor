@@ -8,6 +8,14 @@
 
 #include <Arduino.h>
 
+#ifndef DUAL_CORE_ENCODER_WDT_DISABLE
+#define DUAL_CORE_ENCODER_WDT_DISABLE 0
+#endif
+
+#ifndef DUAL_CORE_ENCODER_WDT_YIELD_CYCLES
+#define DUAL_CORE_ENCODER_WDT_YIELD_CYCLES 500
+#endif
+
 namespace DualCoreEncoder {
 void begin();
 void loop();
