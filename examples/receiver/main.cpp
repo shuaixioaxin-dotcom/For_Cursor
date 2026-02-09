@@ -4,8 +4,6 @@
 #include <cstring>
 
 namespace {
-constexpr int kUartRxPin = 40;
-constexpr int kUartTxPin = 41;
 constexpr uint32_t kUartBaudrate = 2000000;
 
 constexpr uint8_t kMaxEncoders = 32;
@@ -61,7 +59,7 @@ void sendPacketUart(const EncoderPacket& packet) {
 }  // namespace
 
 void setup() {
-    Serial.begin(kUartBaudrate, SERIAL_8N1, kUartRxPin, kUartTxPin);
+    Serial.begin(kUartBaudrate);
     Serial.setRxBufferSize(512);
     Serial.setTxBufferSize(512);
 
