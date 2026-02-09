@@ -7,6 +7,7 @@
 namespace {
 constexpr uint32_t kUartBaudrate = 2000000;
 constexpr uint8_t kEspNowChannel = 1;
+constexpr bool kDebugSerial = true;
 
 constexpr uint8_t kMaxEncoders = 32;
 constexpr uint16_t kUartMagic = 0xA55A;
@@ -26,6 +27,10 @@ struct UartFrameHeader {
 
 EncoderPacket gPacket;
 volatile bool gPacketReady = false;
+volatile uint32_t gRxCount = 0;
+volatile uint32_t gLastRxMs = 0;
+volatile int gLastLen = 0;
+uint8_t gLastMac[6] = {};
 portMUX_TYPE gPacketMux = portMUX_INITIALIZER_UNLOCKED;
 
 void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
@@ -34,10 +39,14 @@ void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
         return;
     }
 
-    portENTER_CRITICAL_ISR(&gPacketMux);
+    portENTER_CRITICAL(&gPacketMux);
     memcpy(&gPacket, data, sizeof(EncoderPacket));
     gPacketReady = true;
-    portEXIT_CRITICAL_ISR(&gPacketMux);
+    gRxCount++;
+    gLastRxMs = millis();
+    gLastLen = len;
+    memcpy(gLastMac, mac, sizeof(gLastMac));
+    portEXIT_CRITICAL(&gPacketMux);
 }
 
 bool initEspNow() {
@@ -74,6 +83,11 @@ void setup() {
 void loop() {
     EncoderPacket local;
     bool hasPacket = false;
+    uint32_t rxCount = 0;
+    uint32_t lastRxMs = 0;
+    int lastLen = 0;
+    uint8_t lastMac[6] = {};
+    static uint32_t lastReportMs = 0;
 
     portENTER_CRITICAL(&gPacketMux);
     if (gPacketReady) {
@@ -81,10 +95,32 @@ void loop() {
         gPacketReady = false;
         hasPacket = true;
     }
+    rxCount = gRxCount;
+    lastRxMs = gLastRxMs;
+    lastLen = gLastLen;
+    memcpy(lastMac, gLastMac, sizeof(lastMac));
     portEXIT_CRITICAL(&gPacketMux);
 
     if (hasPacket) {
         sendPacketUart(local);
+    }
+
+    if (kDebugSerial) {
+        uint32_t now = millis();
+        if (now - lastReportMs >= 1000) {
+            lastReportMs = now;
+            Serial.printf(
+                "# ESP-NOW rx=%lu last_ms=%lu len=%d mac=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                static_cast<unsigned long>(rxCount),
+                static_cast<unsigned long>(lastRxMs),
+                lastLen,
+                lastMac[0],
+                lastMac[1],
+                lastMac[2],
+                lastMac[3],
+                lastMac[4],
+                lastMac[5]);
+        }
     }
 
     vTaskDelay(1);

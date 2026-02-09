@@ -19,6 +19,9 @@ constexpr uint32_t kRs485Baudrate = 2500000;
 constexpr uint8_t kPeerMac[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
 constexpr uint8_t kEspNowChannel = 1;
 constexpr uint32_t kEspNowSendIntervalMs = 5;
+constexpr uint8_t kEncoderTaskCore = 1;
+constexpr UBaseType_t kEncoderTaskPriority = tskIDLE_PRIORITY + 2;
+constexpr uint8_t kSendTaskCore = 0;
 
 MultiEncoder encoder({
     .numEncoders = kEncoderCount,
@@ -116,7 +119,7 @@ void setup() {
         return;
     }
 
-    encoder.start(0, configMAX_PRIORITIES - 1, 4096);
+    encoder.start(kEncoderTaskCore, kEncoderTaskPriority, 4096);
 
     if (!initEspNow()) {
         Serial.println("ESP-NOW init failed.");
@@ -128,9 +131,9 @@ void setup() {
         "EspNowSend",
         4096,
         nullptr,
-        1,
+        tskIDLE_PRIORITY + 1,
         nullptr,
-        1);
+        kSendTaskCore);
 }
 
 void loop() {
