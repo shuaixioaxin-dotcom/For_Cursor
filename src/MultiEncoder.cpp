@@ -189,6 +189,13 @@ bool MultiEncoder::copyIfNew(uint32_t* lastSeq, uint16_t* values, bool* status,
     return true;
 }
 
+void MultiEncoder::processOnce() {
+    if (serial_ == nullptr) {
+        return;
+    }
+    processBatch();
+}
+
 void MultiEncoder::taskTrampoline(void* arg) {
     MultiEncoder* self = static_cast<MultiEncoder*>(arg);
     self->taskLoop();

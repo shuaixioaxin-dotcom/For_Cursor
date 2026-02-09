@@ -8,6 +8,7 @@ namespace {
 constexpr uint32_t kUartBaudrate = 2000000;
 constexpr uint8_t kEspNowChannel = 1;
 constexpr bool kDebugSerial = true;
+constexpr uint32_t kSerialReadyDelayMs = 200;
 
 constexpr uint8_t kMaxEncoders = 32;
 constexpr uint16_t kUartMagic = 0xA55A;
@@ -32,6 +33,10 @@ volatile uint32_t gLastRxMs = 0;
 volatile int gLastLen = 0;
 uint8_t gLastMac[6] = {};
 uint8_t gLocalMac[6] = {};
+volatile esp_err_t gLastChannelErr = ESP_OK;
+volatile esp_err_t gLastInitErr = ESP_OK;
+uint8_t gCurrentChannel = 0;
+wifi_second_chan_t gCurrentSecond = WIFI_SECOND_CHAN_NONE;
 portMUX_TYPE gPacketMux = portMUX_INITIALIZER_UNLOCKED;
 
 void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
@@ -54,9 +59,11 @@ bool initEspNow() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
-    esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
+    gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_get_channel(&gCurrentChannel, &gCurrentSecond);
 
-    if (esp_now_init() != ESP_OK) {
+    gLastInitErr = esp_now_init();
+    if (gLastInitErr != ESP_OK) {
         return false;
     }
 
@@ -75,6 +82,7 @@ void setup() {
     Serial.begin(kUartBaudrate);
     Serial.setRxBufferSize(512);
     Serial.setTxBufferSize(512);
+    delay(kSerialReadyDelayMs);
 
     if (!initEspNow()) {
         Serial.println("ESP-NOW init failed.");
@@ -90,6 +98,10 @@ void setup() {
                       gLocalMac[4],
                       gLocalMac[5],
                       kEspNowChannel);
+        Serial.printf("# ESPNOW init=%d channel_err=%d current_ch=%u\n",
+                      static_cast<int>(gLastInitErr),
+                      static_cast<int>(gLastChannelErr),
+                      gCurrentChannel);
     }
 }
 

@@ -35,6 +35,7 @@ public:
 
     bool copyLatest(uint16_t* values, bool* status, bool* allOk, uint32_t* seq) const;
     bool copyIfNew(uint32_t* lastSeq, uint16_t* values, bool* status, bool* allOk);
+    void processOnce();
 
 private:
     struct EncoderData {
