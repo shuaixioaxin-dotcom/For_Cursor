@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <soc/gpio_struct.h>
+#include <esp_task_wdt.h>
 
 MultiEncoder::MultiEncoder(const Config& config)
     : serial_(nullptr),
@@ -202,11 +203,16 @@ void MultiEncoder::taskTrampoline(void* arg) {
 }
 
 void MultiEncoder::taskLoop() {
+    // 将当前任务注册到 Task WDT，替代 idle task 的监控功能。
+    // 在最高优先级下 idle task 几乎不会被调度，无法自行喂狗。
+    esp_task_wdt_add(NULL);
+
     while (true) {
         processBatch();
         ++batchCounter_;
         if (yieldEveryBatches_ > 0 && batchCounter_ >= yieldEveryBatches_) {
             batchCounter_ = 0;
+            esp_task_wdt_reset();  // 喂狗，防止 WDT 触发 SW_CPU_RESET
             vTaskDelay(yieldDelayTicks_);
             continue;
         }

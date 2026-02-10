@@ -177,15 +177,18 @@ void sendPacketUart(const EncoderPacket& packet) {
 }
 
 void printEncoderPacket(const EncoderPacket& pkt) {
-    Serial.printf(">> ENC seq=%lu cnt=%u all_ok=%u\n",
-                  static_cast<unsigned long>(pkt.seq),
-                  pkt.count,
-                  pkt.all_ok);
     for (uint8_t i = 0; i < pkt.count; ++i) {
-        Serial.printf("   encoder[%u]: value=%5u  status=%s\n",
-                      i, pkt.values[i],
-                      pkt.status[i] ? "OK" : "ERR");
+        uint16_t raw = pkt.values[i];
+        // raw * 360 / 65536 ≈ raw * 1125 / 2048，结果为角度×100
+        uint32_t angle_x100 = (static_cast<uint32_t>(raw) * 1125) >> 11;
+        Serial.printf("%3lu.%02lu",
+                      static_cast<unsigned long>(angle_x100 / 100),
+                      static_cast<unsigned long>(angle_x100 % 100));
+        if (i < pkt.count - 1) {
+            Serial.print(',');
+        }
     }
+    Serial.println();
 }
 }  // namespace
 
@@ -278,6 +281,7 @@ void loop() {
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_task_wdt.h>
 #include <cstring>
 #include <esp_err.h>
 
@@ -549,6 +553,11 @@ void setup() {
     }
 
     if (gEncoderReady && kUseRtosTasks) {
+        // 移除编码器所在核心的 idle task WDT 监控。
+        // 编码器任务以最高优先级运行，idle task 几乎不会被调度到，
+        // 无法自行喂狗，会触发 Task WDT → SW_CPU_RESET。
+        // 编码器任务在其 taskLoop 中自行注册并喂狗。
+        esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(kEncoderTaskCore));
         encoder.start(kEncoderTaskCore, kEncoderTaskPriority, 4096);
     }
 
