@@ -91,6 +91,7 @@ bool initEspNow() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
+    esp_wifi_set_ps(WIFI_PS_NONE);
     gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
     esp_wifi_get_channel(&gCurrentChannel, &gCurrentSecond);
     if (gLastChannelErr != ESP_OK) {
