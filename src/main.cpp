@@ -19,12 +19,14 @@ constexpr uint32_t kRs485Baudrate = 2500000;
 constexpr uint8_t kPeerMac[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
 constexpr bool kUseBroadcastPeer = true;
 constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-constexpr uint8_t kEspNowChannel = 1;
+constexpr uint8_t kEspNowChannel = 0;  // 0 = use current channel
 constexpr uint32_t kEspNowSendIntervalMs = 5;
 constexpr uint32_t kEspNowHeartbeatMs = 1000;
 constexpr bool kDebugSerial = true;
 constexpr uint32_t kDebugPrintIntervalMs = 1000;
 constexpr bool kUseRtosTasks = false;
+constexpr bool kTestOnly = true;
+constexpr uint32_t kTestIntervalMs = 100;
 constexpr uint32_t kSerialReadyDelayMs = 200;
 constexpr uint8_t kEncoderTaskCore = 1;
 constexpr UBaseType_t kEncoderTaskPriority = tskIDLE_PRIORITY + 2;
@@ -59,13 +61,31 @@ struct EncoderPacket {
     uint8_t status[MultiEncoder::kMaxEncoders];
 } __attribute__((packed));
 
+struct TestPacket {
+    uint32_t magic;
+    uint32_t seq;
+    uint32_t ms;
+} __attribute__((packed));
+
+struct AckPacket {
+    uint32_t magic;
+    uint32_t seq;
+} __attribute__((packed));
+
+constexpr uint32_t kTestMagic = 0x454E4F57;  // "ENOW"
+constexpr uint32_t kAckMagic = 0x41434B30;   // "ACK0"
+
 EncoderPacket packet;
 uint16_t values[MultiEncoder::kMaxEncoders];
 bool status[MultiEncoder::kMaxEncoders];
+TestPacket testPacket = {kTestMagic, 0, 0};
 
 volatile uint32_t gTxOkCount = 0;
 volatile uint32_t gTxFailCount = 0;
 volatile uint32_t gTxQueueFailCount = 0;
+volatile uint32_t gTxAttemptCount = 0;
+volatile uint32_t gAckRxCount = 0;
+volatile uint32_t gLastAckSeq = 0;
 volatile esp_err_t gLastChannelErr = ESP_OK;
 volatile esp_err_t gLastInitErr = ESP_OK;
 volatile esp_err_t gLastPeerErr = ESP_OK;
@@ -87,12 +107,28 @@ void onEspNowSend(const uint8_t* mac, esp_now_send_status_t status) {
     }
 }
 
+void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
+    (void)mac;
+    if (len == static_cast<int>(sizeof(AckPacket))) {
+        AckPacket ack;
+        memcpy(&ack, data, sizeof(ack));
+        if (ack.magic == kAckMagic) {
+            gAckRxCount++;
+            gLastAckSeq = ack.seq;
+        }
+    }
+}
+
 bool initEspNow() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
     esp_wifi_set_ps(WIFI_PS_NONE);
-    gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
+    if (kEspNowChannel > 0) {
+        gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
+    } else {
+        gLastChannelErr = ESP_OK;
+    }
     esp_wifi_get_channel(&gCurrentChannel, &gCurrentSecond);
     if (gLastChannelErr != ESP_OK) {
         return false;
@@ -104,11 +140,16 @@ bool initEspNow() {
     }
 
     esp_now_register_send_cb(onEspNowSend);
+    esp_now_register_recv_cb(onEspNowReceive);
 
     esp_now_peer_info_t peerInfo = {};
     const uint8_t* peerMac = getPeerMac();
     memcpy(peerInfo.peer_addr, peerMac, 6);
-    peerInfo.channel = kUseBroadcastPeer ? 0 : kEspNowChannel;
+    if (kUseBroadcastPeer || kEspNowChannel == 0) {
+        peerInfo.channel = 0;
+    } else {
+        peerInfo.channel = kEspNowChannel;
+    }
     peerInfo.ifidx = WIFI_IF_STA;
     peerInfo.encrypt = false;
 
@@ -159,9 +200,16 @@ void trySendPacket(bool* pending, uint32_t* lastSendMs) {
     *lastSendMs = now;
     *pending = false;
 
-    gLastSendErr = esp_now_send(getPeerMac(),
-                                reinterpret_cast<const uint8_t*>(&packet),
-                                sizeof(packet));
+    gTxAttemptCount++;
+    if (kTestOnly) {
+        gLastSendErr = esp_now_send(getPeerMac(),
+                                    reinterpret_cast<const uint8_t*>(&testPacket),
+                                    sizeof(testPacket));
+    } else {
+        gLastSendErr = esp_now_send(getPeerMac(),
+                                    reinterpret_cast<const uint8_t*>(&packet),
+                                    sizeof(packet));
+    }
     if (gLastSendErr != ESP_OK) {
         gTxQueueFailCount++;
         gTxFailCount++;
@@ -187,9 +235,15 @@ void setup() {
     Serial.begin(2000000);
     delay(kSerialReadyDelayMs);
 
-    gEncoderReady = encoder.begin(Serial2);
+    if (!kTestOnly) {
+        gEncoderReady = encoder.begin(Serial2);
+    } else {
+        gEncoderReady = false;
+    }
     if (!gEncoderReady) {
-        Serial.println("Encoder init failed.");
+        if (!kTestOnly) {
+            Serial.println("Encoder init failed.");
+        }
     }
 
     if (gEncoderReady && kUseRtosTasks) {
@@ -229,6 +283,7 @@ void setup() {
         Serial.printf("# ESPNOW current_ch=%u broadcast=%u\n",
                       gCurrentChannel,
                       kUseBroadcastPeer ? 1 : 0);
+        Serial.printf("# ESPNOW test_only=%u\n", kTestOnly ? 1 : 0);
     }
 
     if (gEspNowReady && kUseRtosTasks) {
@@ -253,6 +308,14 @@ void loop() {
             encoder.processOnce();
             updatePacketFromEncoder(&lastSeq, &pending);
         }
+        if (kTestOnly) {
+            uint32_t now = millis();
+            if (now - lastSendMs >= kTestIntervalMs) {
+                testPacket.seq++;
+                testPacket.ms = now;
+                pending = true;
+            }
+        }
         trySendPacket(&pending, &lastSendMs);
     }
 
@@ -262,13 +325,16 @@ void loop() {
         if (now - lastReportMs >= kDebugPrintIntervalMs) {
             lastReportMs = now;
             Serial.printf(
-                "# ESP-NOW tx_ok=%lu tx_fail=%lu queue_fail=%lu last_err=%d "
-                "last_status=%d\n",
+                "# ESP-NOW tx_ok=%lu tx_fail=%lu queue_fail=%lu attempt=%lu last_err=%d "
+                "last_status=%d ack=%lu last_ack=%lu\n",
                           static_cast<unsigned long>(gTxOkCount),
                           static_cast<unsigned long>(gTxFailCount),
                           static_cast<unsigned long>(gTxQueueFailCount),
+                          static_cast<unsigned long>(gTxAttemptCount),
                           static_cast<int>(gLastSendErr),
-                          static_cast<int>(gLastSendStatus));
+                          static_cast<int>(gLastSendStatus),
+                          static_cast<unsigned long>(gAckRxCount),
+                          static_cast<unsigned long>(gLastAckSeq));
         }
     }
     vTaskDelay(1);

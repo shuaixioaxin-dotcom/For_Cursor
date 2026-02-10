@@ -6,10 +6,11 @@
 
 namespace {
 constexpr uint32_t kUartBaudrate = 2000000;
-constexpr uint8_t kEspNowChannel = 1;
+constexpr uint8_t kEspNowChannel = 0;  // 0 = use current channel
 constexpr bool kDebugSerial = true;
 constexpr uint32_t kSerialReadyDelayMs = 200;
 constexpr size_t kDebugPayloadBytes = 8;
+constexpr bool kSendAck = true;
 
 constexpr uint8_t kMaxEncoders = 32;
 constexpr uint16_t kUartMagic = 0xA55A;
@@ -22,6 +23,20 @@ struct EncoderPacket {
     uint8_t status[kMaxEncoders];
 } __attribute__((packed));
 
+struct TestPacket {
+    uint32_t magic;
+    uint32_t seq;
+    uint32_t ms;
+} __attribute__((packed));
+
+struct AckPacket {
+    uint32_t magic;
+    uint32_t seq;
+} __attribute__((packed));
+
+constexpr uint32_t kTestMagic = 0x454E4F57;  // "ENOW"
+constexpr uint32_t kAckMagic = 0x41434B30;   // "ACK0"
+
 struct UartFrameHeader {
     uint16_t magic;
     uint16_t length;
@@ -32,6 +47,10 @@ volatile bool gPacketReady = false;
 volatile uint32_t gRxCount = 0;
 volatile uint32_t gRxValid = 0;
 volatile uint32_t gRxBadLen = 0;
+volatile uint32_t gTestRxCount = 0;
+volatile uint32_t gLastTestSeq = 0;
+volatile uint32_t gAckSendCount = 0;
+volatile uint32_t gAckSendFail = 0;
 volatile uint32_t gLastRxMs = 0;
 volatile int gLastLen = 0;
 uint8_t gLastMac[6] = {};
@@ -41,7 +60,22 @@ volatile esp_err_t gLastChannelErr = ESP_OK;
 volatile esp_err_t gLastInitErr = ESP_OK;
 uint8_t gCurrentChannel = 0;
 wifi_second_chan_t gCurrentSecond = WIFI_SECOND_CHAN_NONE;
+volatile esp_err_t gLastAckErr = ESP_OK;
 portMUX_TYPE gPacketMux = portMUX_INITIALIZER_UNLOCKED;
+
+bool ensurePeer(const uint8_t* mac) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, mac, 6);
+    peerInfo.ifidx = WIFI_IF_STA;
+    peerInfo.encrypt = false;
+    if (kEspNowChannel > 0) {
+        peerInfo.channel = kEspNowChannel;
+    } else {
+        peerInfo.channel = 0;
+    }
+    esp_err_t err = esp_now_add_peer(&peerInfo);
+    return (err == ESP_OK || err == ESP_ERR_ESPNOW_EXIST);
+}
 
 void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
     portENTER_CRITICAL(&gPacketMux);
@@ -54,6 +88,27 @@ void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
     if (copyLen > 0) {
         memcpy(gLastPayload, data, copyLen);
     }
+    if (len == static_cast<int>(sizeof(TestPacket))) {
+        TestPacket test;
+        memcpy(&test, data, sizeof(test));
+        if (test.magic == kTestMagic) {
+            gTestRxCount++;
+            gLastTestSeq = test.seq;
+            if (kSendAck) {
+                ensurePeer(mac);
+                AckPacket ack = {kAckMagic, test.seq};
+                gLastAckErr = esp_now_send(mac,
+                                           reinterpret_cast<const uint8_t*>(&ack),
+                                           sizeof(ack));
+                if (gLastAckErr == ESP_OK) {
+                    gAckSendCount++;
+                } else {
+                    gAckSendFail++;
+                }
+            }
+        }
+    }
+
     if (len == static_cast<int>(sizeof(EncoderPacket))) {
         memcpy(&gPacket, data, sizeof(EncoderPacket));
         gPacketReady = true;
@@ -69,7 +124,11 @@ bool initEspNow() {
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
     esp_wifi_set_ps(WIFI_PS_NONE);
-    gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
+    if (kEspNowChannel > 0) {
+        gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
+    } else {
+        gLastChannelErr = ESP_OK;
+    }
     esp_wifi_get_channel(&gCurrentChannel, &gCurrentSecond);
 
     gLastInitErr = esp_now_init();
@@ -151,10 +210,13 @@ void loop() {
         if (now - lastReportMs >= 1000) {
             lastReportMs = now;
             Serial.printf(
-                "# ESP-NOW rx=%lu ok=%lu bad=%lu last_ms=%lu len=%d mac=%02X:%02X:%02X:%02X:%02X:%02X payload=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                "# ESP-NOW rx=%lu ok=%lu bad=%lu test=%lu ack_ok=%lu ack_fail=%lu last_ms=%lu len=%d mac=%02X:%02X:%02X:%02X:%02X:%02X payload=%02X %02X %02X %02X %02X %02X %02X %02X\n",
                 static_cast<unsigned long>(rxCount),
                 static_cast<unsigned long>(rxValid),
                 static_cast<unsigned long>(rxBadLen),
+                static_cast<unsigned long>(gTestRxCount),
+                static_cast<unsigned long>(gAckSendCount),
+                static_cast<unsigned long>(gAckSendFail),
                 static_cast<unsigned long>(lastRxMs),
                 lastLen,
                 lastMac[0],
