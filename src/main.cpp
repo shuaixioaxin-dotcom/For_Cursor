@@ -82,7 +82,15 @@ bool ensurePeer(const uint8_t* mac) {
     return (err == ESP_OK || err == ESP_ERR_ESPNOW_EXIST);
 }
 
+// FIX: 将 esp_now_send (ACK) 移到临界区外。
+// 原代码在 portENTER_CRITICAL 内调用 esp_now_send / esp_now_add_peer，
+// 而 portENTER_CRITICAL 会禁用中断，WiFi 子系统的操作在此状态下可能
+// 死锁或返回错误，导致 ACK 发送失败甚至影响后续数据接收。
 void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
+    bool shouldSendAck = false;
+    uint8_t ackMac[6];
+    uint32_t ackSeq = 0;
+
     portENTER_CRITICAL(&gPacketMux);
     gRxCount++;
     gLastRxMs = millis();
@@ -100,16 +108,9 @@ void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
             gTestRxCount++;
             gLastTestSeq = test.seq;
             if (kSendAck) {
-                ensurePeer(mac);
-                AckPacket ack = {kAckMagic, test.seq};
-                gLastAckErr = esp_now_send(mac,
-                                           reinterpret_cast<const uint8_t*>(&ack),
-                                           sizeof(ack));
-                if (gLastAckErr == ESP_OK) {
-                    gAckSendCount++;
-                } else {
-                    gAckSendFail++;
-                }
+                shouldSendAck = true;
+                memcpy(ackMac, mac, 6);
+                ackSeq = test.seq;
             }
         }
     }
@@ -122,6 +123,20 @@ void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
         gRxBadLen++;
     }
     portEXIT_CRITICAL(&gPacketMux);
+
+    // ACK 发送在临界区外执行，避免在中断禁用状态下调用 WiFi API
+    if (shouldSendAck) {
+        ensurePeer(ackMac);
+        AckPacket ack = {kAckMagic, ackSeq};
+        gLastAckErr = esp_now_send(ackMac,
+                                   reinterpret_cast<const uint8_t*>(&ack),
+                                   sizeof(ack));
+        if (gLastAckErr == ESP_OK) {
+            gAckSendCount++;
+        } else {
+            gAckSendFail++;
+        }
+    }
 }
 
 // FIX: 修复了 WiFi 初始化序列
@@ -632,6 +647,20 @@ void loop() {
                           static_cast<int>(gLastSendStatus),
                           static_cast<unsigned long>(gAckRxCount),
                           static_cast<unsigned long>(gLastAckSeq));
+
+            // 打印发送端本地编码器数据，便于确认编码器是否正常工作
+            if (!kTestOnly) {
+                Serial.printf("# ENC-TX seq=%lu cnt=%u ok=%u enc_ready=%u |",
+                              static_cast<unsigned long>(packet.seq),
+                              packet.count,
+                              packet.all_ok,
+                              gEncoderReady ? 1 : 0);
+                for (uint8_t i = 0; i < packet.count; ++i) {
+                    Serial.printf(" [%u]=%u(%s)", i, packet.values[i],
+                                  packet.status[i] ? "OK" : "ERR");
+                }
+                Serial.println();
+            }
         }
     }
     vTaskDelay(1);
