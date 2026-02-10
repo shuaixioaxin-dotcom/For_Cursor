@@ -16,6 +16,8 @@ constexpr bool kDebugSerial = true;
 constexpr uint32_t kSerialReadyDelayMs = 200;
 constexpr size_t kDebugPayloadBytes = 8;
 constexpr bool kSendAck = true;
+constexpr bool kForwardUartBinary = false;  // 设为 true 时通过 UART 转发二进制帧，
+                                            // false 时仅在串口打印可读文本
 
 constexpr uint8_t kMaxEncoders = 32;
 constexpr uint16_t kUartMagic = 0xA55A;
@@ -175,15 +177,15 @@ void sendPacketUart(const EncoderPacket& packet) {
 }
 
 void printEncoderPacket(const EncoderPacket& pkt) {
-    Serial.printf("# ENC seq=%lu cnt=%u ok=%u |",
+    Serial.printf(">> ENC seq=%lu cnt=%u all_ok=%u\n",
                   static_cast<unsigned long>(pkt.seq),
                   pkt.count,
                   pkt.all_ok);
     for (uint8_t i = 0; i < pkt.count; ++i) {
-        Serial.printf(" [%u]=%u(%s)", i, pkt.values[i],
+        Serial.printf("   encoder[%u]: value=%5u  status=%s\n",
+                      i, pkt.values[i],
                       pkt.status[i] ? "OK" : "ERR");
     }
-    Serial.println();
 }
 }  // namespace
 
@@ -242,7 +244,9 @@ void loop() {
     portEXIT_CRITICAL(&gPacketMux);
 
     if (hasPacket) {
-        sendPacketUart(local);
+        if (kForwardUartBinary) {
+            sendPacketUart(local);
+        }
         printEncoderPacket(local);
     }
 
@@ -251,30 +255,17 @@ void loop() {
         if (now - lastReportMs >= 1000) {
             lastReportMs = now;
             Serial.printf(
-                "# ESP-NOW rx=%lu ok=%lu bad=%lu test=%lu ack_ok=%lu ack_fail=%lu last_ms=%lu len=%d mac=%02X:%02X:%02X:%02X:%02X:%02X payload=%02X %02X %02X %02X %02X %02X %02X %02X ack_err=%d\n",
+                "-- STAT rx_total=%lu enc_ok=%lu bad_len=%lu last_len=%d from=%02X:%02X:%02X:%02X:%02X:%02X\n",
                 static_cast<unsigned long>(rxCount),
                 static_cast<unsigned long>(rxValid),
                 static_cast<unsigned long>(rxBadLen),
-                static_cast<unsigned long>(gTestRxCount),
-                static_cast<unsigned long>(gAckSendCount),
-                static_cast<unsigned long>(gAckSendFail),
-                static_cast<unsigned long>(lastRxMs),
                 lastLen,
                 lastMac[0],
                 lastMac[1],
                 lastMac[2],
                 lastMac[3],
                 lastMac[4],
-                lastMac[5],
-                lastPayload[0],
-                lastPayload[1],
-                lastPayload[2],
-                lastPayload[3],
-                lastPayload[4],
-                lastPayload[5],
-                lastPayload[6],
-                lastPayload[7],
-                static_cast<int>(gLastAckErr));
+                lastMac[5]);
         }
     }
 
@@ -636,30 +627,26 @@ void loop() {
         if (now - lastReportMs >= kDebugPrintIntervalMs) {
             lastReportMs = now;
             Serial.printf(
-                "# ESP-NOW tx_ok=%lu tx_fail=%lu queue_fail=%lu attempt=%lu last_err=%d "
-                "err_name=%s last_status=%d ack=%lu last_ack=%lu\n",
+                "-- TX tx_ok=%lu tx_fail=%lu attempt=%lu send_err=%d(%s) espnow_ready=%u enc_ready=%u\n",
                           static_cast<unsigned long>(gTxOkCount),
                           static_cast<unsigned long>(gTxFailCount),
-                          static_cast<unsigned long>(gTxQueueFailCount),
                           static_cast<unsigned long>(gTxAttemptCount),
                           static_cast<int>(gLastSendErr),
                           esp_err_to_name(static_cast<esp_err_t>(gLastSendErr)),
-                          static_cast<int>(gLastSendStatus),
-                          static_cast<unsigned long>(gAckRxCount),
-                          static_cast<unsigned long>(gLastAckSeq));
+                          gEspNowReady ? 1 : 0,
+                          gEncoderReady ? 1 : 0);
 
-            // 打印发送端本地编码器数据，便于确认编码器是否正常工作
+            // 打印发送端本地编码器数据，便于确认编码器硬件是否正常工作
             if (!kTestOnly) {
-                Serial.printf("# ENC-TX seq=%lu cnt=%u ok=%u enc_ready=%u |",
+                Serial.printf(">> ENC-TX seq=%lu cnt=%u all_ok=%u\n",
                               static_cast<unsigned long>(packet.seq),
                               packet.count,
-                              packet.all_ok,
-                              gEncoderReady ? 1 : 0);
+                              packet.all_ok);
                 for (uint8_t i = 0; i < packet.count; ++i) {
-                    Serial.printf(" [%u]=%u(%s)", i, packet.values[i],
+                    Serial.printf("   encoder[%u]: value=%5u  status=%s\n",
+                                  i, packet.values[i],
                                   packet.status[i] ? "OK" : "ERR");
                 }
-                Serial.println();
             }
         }
     }
