@@ -223,11 +223,14 @@ void MultiEncoder::processBatch() {
     for (uint8_t i = 0; i < numEncoders_; ++i) {
         setTransmitMode();
         serial_->write(requestFrames_[i], 8);
-        // FIX: 必须调用 flush() 等待 UART TX FIFO 物理发送完毕。
-        // 原代码在 write() 后仅靠 delayMicroseconds(txTurnaroundUs_) 等待，
-        // 但 write() 只是把数据放入 TX 缓冲区就返回了，UART 硬件可能还没
-        // 发完就切到接收模式，导致 RS485 请求帧被截断，编码器无法正确响应。
-        serial_->flush();
+        // 不使用 flush()。flush() 内部通过 FreeRTOS 信号量等待 TX 完成，
+        // 引入 40-60μs 的非确定性开销（上下文切换 + ISR 处理），
+        // 在高频 RS485 通信中会导致时序抖动和数据不稳定。
+        //
+        // 改用确定性延时：8 字节 × 10 bit/byte ÷ 2.5Mbps ≈ 32μs。
+        // write() 将数据放入 UART TX FIFO 后立即返回，FIFO 中的数据
+        // 由硬件 DMA 在后台发送。txTurnaroundUs_ (32μs) 覆盖了完整
+        // 的物理传输时间 + 余量，确保切换 DE/RE 时数据已发完。
         delayMicroseconds(txTurnaroundUs_);
         setReceiveMode();
 

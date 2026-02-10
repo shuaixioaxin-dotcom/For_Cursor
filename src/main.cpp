@@ -301,12 +301,14 @@ constexpr uint32_t kEspNowSendIntervalMs = 5;
 constexpr uint32_t kEspNowHeartbeatMs = 1000;
 constexpr bool kDebugSerial = true;
 constexpr uint32_t kDebugPrintIntervalMs = 1000;
-constexpr bool kUseRtosTasks = false;
+constexpr bool kUseRtosTasks = true;   // 启用双核模式：编码器采集与 ESP-NOW 发送分核运行
 constexpr bool kTestOnly = false;
 constexpr uint32_t kTestIntervalMs = 100;
 constexpr uint32_t kSerialReadyDelayMs = 200;
+// Core 1：编码器 RS485 采集（独占核心，不受 WiFi 干扰）
+// Core 0：ESP-NOW 发送（WiFi 栈原生在 Core 0）
 constexpr uint8_t kEncoderTaskCore = 1;
-constexpr UBaseType_t kEncoderTaskPriority = tskIDLE_PRIORITY + 2;
+constexpr UBaseType_t kEncoderTaskPriority = configMAX_PRIORITIES - 1;  // 最高优先级
 constexpr uint8_t kSendTaskCore = 0;
 
 const uint8_t* getPeerMac() {
