@@ -3,6 +3,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <cstring>
+#include <esp_err.h>
 
 #include "MultiEncoder.h"
 
@@ -19,7 +20,7 @@ constexpr uint32_t kRs485Baudrate = 2500000;
 constexpr uint8_t kPeerMac[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
 constexpr bool kUseBroadcastPeer = true;
 constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-constexpr uint8_t kEspNowChannel = 0;  // 0 = use current channel
+constexpr uint8_t kEspNowChannel = 1;
 constexpr uint32_t kEspNowSendIntervalMs = 5;
 constexpr uint32_t kEspNowHeartbeatMs = 1000;
 constexpr bool kDebugSerial = true;
@@ -86,6 +87,9 @@ volatile uint32_t gTxQueueFailCount = 0;
 volatile uint32_t gTxAttemptCount = 0;
 volatile uint32_t gAckRxCount = 0;
 volatile uint32_t gLastAckSeq = 0;
+volatile esp_err_t gLastWifiStopErr = ESP_OK;
+volatile esp_err_t gLastWifiStartErr = ESP_OK;
+volatile esp_err_t gLastDeinitErr = ESP_OK;
 volatile esp_err_t gLastChannelErr = ESP_OK;
 volatile esp_err_t gLastInitErr = ESP_OK;
 volatile esp_err_t gLastPeerErr = ESP_OK;
@@ -124,16 +128,15 @@ bool initEspNow() {
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
     esp_wifi_set_ps(WIFI_PS_NONE);
-    if (kEspNowChannel > 0) {
-        gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
-    } else {
-        gLastChannelErr = ESP_OK;
-    }
+    gLastWifiStopErr = esp_wifi_stop();
+    gLastWifiStartErr = esp_wifi_start();
+    gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
     esp_wifi_get_channel(&gCurrentChannel, &gCurrentSecond);
     if (gLastChannelErr != ESP_OK) {
         return false;
     }
 
+    gLastDeinitErr = esp_now_deinit();
     gLastInitErr = esp_now_init();
     if (gLastInitErr != ESP_OK) {
         return false;
@@ -145,11 +148,7 @@ bool initEspNow() {
     esp_now_peer_info_t peerInfo = {};
     const uint8_t* peerMac = getPeerMac();
     memcpy(peerInfo.peer_addr, peerMac, 6);
-    if (kUseBroadcastPeer || kEspNowChannel == 0) {
-        peerInfo.channel = 0;
-    } else {
-        peerInfo.channel = kEspNowChannel;
-    }
+    peerInfo.channel = kUseBroadcastPeer ? 0 : kEspNowChannel;
     peerInfo.ifidx = WIFI_IF_STA;
     peerInfo.encrypt = false;
 
@@ -284,6 +283,10 @@ void setup() {
                       gCurrentChannel,
                       kUseBroadcastPeer ? 1 : 0);
         Serial.printf("# ESPNOW test_only=%u\n", kTestOnly ? 1 : 0);
+        Serial.printf("# WIFI stop=%d start=%d deinit=%d\n",
+                      static_cast<int>(gLastWifiStopErr),
+                      static_cast<int>(gLastWifiStartErr),
+                      static_cast<int>(gLastDeinitErr));
     }
 
     if (gEspNowReady && kUseRtosTasks) {
@@ -326,12 +329,13 @@ void loop() {
             lastReportMs = now;
             Serial.printf(
                 "# ESP-NOW tx_ok=%lu tx_fail=%lu queue_fail=%lu attempt=%lu last_err=%d "
-                "last_status=%d ack=%lu last_ack=%lu\n",
+                "err_name=%s last_status=%d ack=%lu last_ack=%lu\n",
                           static_cast<unsigned long>(gTxOkCount),
                           static_cast<unsigned long>(gTxFailCount),
                           static_cast<unsigned long>(gTxQueueFailCount),
                           static_cast<unsigned long>(gTxAttemptCount),
                           static_cast<int>(gLastSendErr),
+                          esp_err_to_name(static_cast<esp_err_t>(gLastSendErr)),
                           static_cast<int>(gLastSendStatus),
                           static_cast<unsigned long>(gAckRxCount),
                           static_cast<unsigned long>(gLastAckSeq));

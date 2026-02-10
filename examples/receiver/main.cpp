@@ -3,10 +3,11 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <cstring>
+#include <esp_err.h>
 
 namespace {
 constexpr uint32_t kUartBaudrate = 2000000;
-constexpr uint8_t kEspNowChannel = 0;  // 0 = use current channel
+constexpr uint8_t kEspNowChannel = 1;
 constexpr bool kDebugSerial = true;
 constexpr uint32_t kSerialReadyDelayMs = 200;
 constexpr size_t kDebugPayloadBytes = 8;
@@ -61,6 +62,9 @@ volatile esp_err_t gLastInitErr = ESP_OK;
 uint8_t gCurrentChannel = 0;
 wifi_second_chan_t gCurrentSecond = WIFI_SECOND_CHAN_NONE;
 volatile esp_err_t gLastAckErr = ESP_OK;
+volatile esp_err_t gLastWifiStopErr = ESP_OK;
+volatile esp_err_t gLastWifiStartErr = ESP_OK;
+volatile esp_err_t gLastDeinitErr = ESP_OK;
 portMUX_TYPE gPacketMux = portMUX_INITIALIZER_UNLOCKED;
 
 bool ensurePeer(const uint8_t* mac) {
@@ -124,13 +128,12 @@ bool initEspNow() {
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
     esp_wifi_set_ps(WIFI_PS_NONE);
-    if (kEspNowChannel > 0) {
-        gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
-    } else {
-        gLastChannelErr = ESP_OK;
-    }
+    gLastWifiStopErr = esp_wifi_stop();
+    gLastWifiStartErr = esp_wifi_start();
+    gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
     esp_wifi_get_channel(&gCurrentChannel, &gCurrentSecond);
 
+    gLastDeinitErr = esp_now_deinit();
     gLastInitErr = esp_now_init();
     if (gLastInitErr != ESP_OK) {
         return false;
@@ -171,6 +174,10 @@ void setup() {
                       static_cast<int>(gLastInitErr),
                       static_cast<int>(gLastChannelErr),
                       gCurrentChannel);
+        Serial.printf("# WIFI stop=%d start=%d deinit=%d\n",
+                      static_cast<int>(gLastWifiStopErr),
+                      static_cast<int>(gLastWifiStartErr),
+                      static_cast<int>(gLastDeinitErr));
     }
 }
 
@@ -210,7 +217,7 @@ void loop() {
         if (now - lastReportMs >= 1000) {
             lastReportMs = now;
             Serial.printf(
-                "# ESP-NOW rx=%lu ok=%lu bad=%lu test=%lu ack_ok=%lu ack_fail=%lu last_ms=%lu len=%d mac=%02X:%02X:%02X:%02X:%02X:%02X payload=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                "# ESP-NOW rx=%lu ok=%lu bad=%lu test=%lu ack_ok=%lu ack_fail=%lu last_ms=%lu len=%d mac=%02X:%02X:%02X:%02X:%02X:%02X payload=%02X %02X %02X %02X %02X %02X %02X %02X ack_err=%d\n",
                 static_cast<unsigned long>(rxCount),
                 static_cast<unsigned long>(rxValid),
                 static_cast<unsigned long>(rxBadLen),
@@ -232,7 +239,8 @@ void loop() {
                 lastPayload[4],
                 lastPayload[5],
                 lastPayload[6],
-                lastPayload[7]);
+                lastPayload[7],
+                static_cast<int>(gLastAckErr));
         }
     }
 
