@@ -15,16 +15,16 @@ constexpr int kRs485TxPin = 33;
 constexpr int kRs485DeRePin = 25;
 constexpr uint32_t kRs485Baudrate = 2500000;
 
-// Update with receiver MAC address.
+// Update with receiver MAC address (when not using broadcast).
 constexpr uint8_t kPeerMac[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
-constexpr bool kUseBroadcastPeer = false;
+constexpr bool kUseBroadcastPeer = true;
 constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 constexpr uint8_t kEspNowChannel = 1;
 constexpr uint32_t kEspNowSendIntervalMs = 5;
 constexpr uint32_t kEspNowHeartbeatMs = 1000;
 constexpr bool kDebugSerial = true;
 constexpr uint32_t kDebugPrintIntervalMs = 1000;
-constexpr bool kUseRtosTasks = true;
+constexpr bool kUseRtosTasks = false;
 constexpr uint32_t kSerialReadyDelayMs = 200;
 constexpr uint8_t kEncoderTaskCore = 1;
 constexpr UBaseType_t kEncoderTaskPriority = tskIDLE_PRIORITY + 2;
@@ -72,6 +72,8 @@ volatile esp_err_t gLastPeerErr = ESP_OK;
 volatile esp_err_t gLastSendErr = ESP_OK;
 volatile esp_now_send_status_t gLastSendStatus = ESP_NOW_SEND_FAIL;
 uint8_t gLocalMac[6] = {};
+uint8_t gCurrentChannel = 0;
+wifi_second_chan_t gCurrentSecond = WIFI_SECOND_CHAN_NONE;
 bool gEspNowReady = false;
 bool gEncoderReady = false;
 
@@ -90,6 +92,7 @@ bool initEspNow() {
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
     gLastChannelErr = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_get_channel(&gCurrentChannel, &gCurrentSecond);
     if (gLastChannelErr != ESP_OK) {
         return false;
     }
@@ -104,7 +107,8 @@ bool initEspNow() {
     esp_now_peer_info_t peerInfo = {};
     const uint8_t* peerMac = getPeerMac();
     memcpy(peerInfo.peer_addr, peerMac, 6);
-    peerInfo.channel = kEspNowChannel;
+    peerInfo.channel = kUseBroadcastPeer ? 0 : kEspNowChannel;
+    peerInfo.ifidx = ESP_IF_WIFI_STA;
     peerInfo.encrypt = false;
 
     gLastPeerErr = esp_now_add_peer(&peerInfo);
@@ -115,7 +119,7 @@ bool initEspNow() {
     return true;
 }
 
-void updatePacketFromEncoder(uint32_t* lastSeq, bool* pending, bool* hasPacket) {
+void updatePacketFromEncoder(uint32_t* lastSeq, bool* pending) {
     bool allOk = false;
     if (!encoder.copyIfNew(lastSeq, values, status, &allOk)) {
         return;
@@ -133,10 +137,9 @@ void updatePacketFromEncoder(uint32_t* lastSeq, bool* pending, bool* hasPacket) 
         packet.status[i] = 0;
     }
     *pending = true;
-    *hasPacket = true;
 }
 
-void trySendPacket(bool* pending, bool hasPacket, uint32_t* lastSendMs) {
+void trySendPacket(bool* pending, uint32_t* lastSendMs) {
     if (!gEspNowReady) {
         return;
     }
@@ -145,8 +148,8 @@ void trySendPacket(bool* pending, bool hasPacket, uint32_t* lastSendMs) {
     bool dueSend =
         *pending &&
         (kEspNowSendIntervalMs == 0 || (now - *lastSendMs) >= kEspNowSendIntervalMs);
-    bool dueHeartbeat = !*pending && hasPacket && kEspNowHeartbeatMs > 0 &&
-                        (now - *lastSendMs) >= kEspNowHeartbeatMs;
+    bool dueHeartbeat =
+        !*pending && kEspNowHeartbeatMs > 0 && (now - *lastSendMs) >= kEspNowHeartbeatMs;
 
     if (!dueSend && !dueHeartbeat) {
         return;
@@ -169,11 +172,10 @@ void taskEspNowSender(void* parameter) {
     uint32_t lastSeq = 0;
     uint32_t lastSendMs = 0;
     bool pending = false;
-    bool hasPacket = false;
 
     while (true) {
-        updatePacketFromEncoder(&lastSeq, &pending, &hasPacket);
-        trySendPacket(&pending, hasPacket, &lastSendMs);
+        updatePacketFromEncoder(&lastSeq, &pending);
+        trySendPacket(&pending, &lastSendMs);
 
         vTaskDelay(1);
     }
@@ -223,6 +225,9 @@ void setup() {
                       static_cast<int>(gLastInitErr),
                       static_cast<int>(gLastChannelErr),
                       static_cast<int>(gLastPeerErr));
+        Serial.printf("# ESPNOW current_ch=%u broadcast=%u\n",
+                      gCurrentChannel,
+                      kUseBroadcastPeer ? 1 : 0);
     }
 
     if (gEspNowReady && kUseRtosTasks) {
@@ -241,12 +246,13 @@ void loop() {
     static uint32_t lastSeq = 0;
     static uint32_t lastSendMs = 0;
     static bool pending = false;
-    static bool hasPacket = false;
 
-    if (gEncoderReady && !kUseRtosTasks) {
-        encoder.processOnce();
-        updatePacketFromEncoder(&lastSeq, &pending, &hasPacket);
-        trySendPacket(&pending, hasPacket, &lastSendMs);
+    if (!kUseRtosTasks) {
+        if (gEncoderReady) {
+            encoder.processOnce();
+            updatePacketFromEncoder(&lastSeq, &pending);
+        }
+        trySendPacket(&pending, &lastSendMs);
     }
 
     if (kDebugSerial) {
