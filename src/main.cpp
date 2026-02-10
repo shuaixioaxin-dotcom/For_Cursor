@@ -158,6 +158,18 @@ void sendPacketUart(const EncoderPacket& packet) {
     Serial.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header));
     Serial.write(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
 }
+
+void printEncoderPacket(const EncoderPacket& pkt) {
+    Serial.printf("# ENC seq=%lu cnt=%u ok=%u |",
+                  static_cast<unsigned long>(pkt.seq),
+                  pkt.count,
+                  pkt.all_ok);
+    for (uint8_t i = 0; i < pkt.count; ++i) {
+        Serial.printf(" [%u]=%u(%s)", i, pkt.values[i],
+                      pkt.status[i] ? "OK" : "ERR");
+    }
+    Serial.println();
+}
 }  // namespace
 
 void setup() {
@@ -216,6 +228,7 @@ void loop() {
 
     if (hasPacket) {
         sendPacketUart(local);
+        printEncoderPacket(local);
     }
 
     if (kDebugSerial) {
@@ -283,7 +296,7 @@ constexpr uint32_t kEspNowHeartbeatMs = 1000;
 constexpr bool kDebugSerial = true;
 constexpr uint32_t kDebugPrintIntervalMs = 1000;
 constexpr bool kUseRtosTasks = false;
-constexpr bool kTestOnly = true;
+constexpr bool kTestOnly = false;
 constexpr uint32_t kTestIntervalMs = 100;
 constexpr uint32_t kSerialReadyDelayMs = 200;
 constexpr uint8_t kEncoderTaskCore = 1;
