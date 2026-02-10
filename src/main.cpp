@@ -108,7 +108,7 @@ bool initEspNow() {
     const uint8_t* peerMac = getPeerMac();
     memcpy(peerInfo.peer_addr, peerMac, 6);
     peerInfo.channel = kUseBroadcastPeer ? 0 : kEspNowChannel;
-    peerInfo.ifidx = ESP_IF_WIFI_STA;
+    peerInfo.ifidx = WIFI_IF_STA;
     peerInfo.encrypt = false;
 
     gLastPeerErr = esp_now_add_peer(&peerInfo);
