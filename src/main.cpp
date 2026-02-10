@@ -1,15 +1,17 @@
 /**
- * ESP-NOW Encoder Data Transceiver
+ * ESP-NOW Encoder Data Transceiver — Broadcast Mode
  *
  * FLAGE==1: Receiver (master) — receives encoder data via ESP-NOW,
  *           transparently forwards to UART.
- * FLAGE==0: Sender (server)  — reads encoders via RS485, sends via ESP-NOW.
+ * FLAGE==0: Sender (server)  — reads encoders via RS485, sends via ESP-NOW
+ *           broadcast.
  *
- * KEY FIX: The sender's initEspNow() previously called esp_wifi_set_channel()
- *          between esp_wifi_stop() and esp_wifi_start(). This silently fails
- *          because the WiFi driver must be started before setting the channel.
- *          The sender ended up on the wrong channel, so the receiver on ch1
- *          never received any packets.
+ * CHANGES (v2):
+ *   1. Sender uses BROADCAST (FF:FF:FF:FF:FF:FF) — no MAC config needed.
+ *   2. Receiver callback compatible with both Arduino ESP32 v2.x and v3.x.
+ *   3. Receiver logs ALL incoming ESP-NOW packets (not just matching size).
+ *   4. Robust channel setting with retry and verification.
+ *   5. Sender channel fix retained (set_channel AFTER wifi_start).
  */
 
 #define FLAGE 0
@@ -46,79 +48,114 @@ struct UartFrameHeader {
 EncoderPacket gPacket;
 volatile bool gPacketReady = false;
 volatile uint32_t gRxCount = 0;
+volatile uint32_t gRxBadLen = 0;
 volatile uint32_t gLastRxMs = 0;
 volatile int gLastLen = 0;
 uint8_t gLastMac[6] = {};
 uint8_t gLocalMac[6] = {};
 portMUX_TYPE gPacketMux = portMUX_INITIALIZER_UNLOCKED;
 
-/**
- * ESP-NOW receive callback.
- * Copies the incoming packet into the global buffer for the main loop
- * to forward via UART (transparent pass-through).
- */
-void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
-    if (len != static_cast<int>(sizeof(EncoderPacket))) {
-        return;
-    }
+// ---- ESP-NOW receive callback (compatible with v2.x and v3.x) ----
+//
+// Arduino ESP32 v2.x (ESP-IDF 4.x):
+//   typedef void (*esp_now_recv_cb_t)(const uint8_t *mac_addr,
+//                                     const uint8_t *data, int data_len);
+//
+// Arduino ESP32 v3.x (ESP-IDF 5.x):
+//   typedef void (*esp_now_recv_cb_t)(const esp_now_recv_info_t *esp_now_info,
+//                                     const uint8_t *data, int data_len);
+//
+// We detect the version at compile time.
 
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
+// ---- v3.x / ESP-IDF 5.x callback ----
+void onEspNowReceive(const esp_now_recv_info_t* info, const uint8_t* data,
+                     int len) {
+    const uint8_t* mac = info->src_addr;
+#else
+// ---- v2.x / ESP-IDF 4.x callback ----
+void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
+#endif
     portENTER_CRITICAL(&gPacketMux);
-    memcpy(&gPacket, data, sizeof(EncoderPacket));
-    gPacketReady = true;
     gRxCount++;
     gLastRxMs = millis();
     gLastLen = len;
-    memcpy(gLastMac, mac, sizeof(gLastMac));
+    if (mac) {
+        memcpy(gLastMac, mac, 6);
+    }
+
+    if (len == static_cast<int>(sizeof(EncoderPacket))) {
+        memcpy(&gPacket, data, sizeof(EncoderPacket));
+        gPacketReady = true;
+    } else {
+        gRxBadLen++;
+    }
     portEXIT_CRITICAL(&gPacketMux);
 }
 
 /**
- * Initialise WiFi + ESP-NOW for the receiver.
- *
- * FIX: Ensure esp_wifi_set_channel() is called AFTER WiFi is fully started.
- *      Previously in sender code, it was called between stop/start, causing
- *      silent failure. Here we also add error checking and a small delay
- *      for robustness.
+ * Set WiFi channel with retry and verification.
  */
+bool setChannelRobust(uint8_t channel, int maxRetries = 5) {
+    for (int attempt = 0; attempt < maxRetries; ++attempt) {
+        esp_err_t err =
+            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        if (err != ESP_OK) {
+            Serial.printf("# set_channel attempt %d failed: 0x%X\n",
+                          attempt + 1, err);
+            delay(100);
+            continue;
+        }
+
+        // Verify
+        uint8_t actualCh = 0;
+        wifi_second_chan_t secondCh;
+        esp_wifi_get_channel(&actualCh, &secondCh);
+        if (actualCh == channel) {
+            Serial.printf("# Channel set to %u (verified, attempt %d)\n",
+                          actualCh, attempt + 1);
+            return true;
+        }
+
+        Serial.printf("# Channel mismatch: wanted %u got %u, retrying...\n",
+                      channel, actualCh);
+        delay(100);
+    }
+    return false;
+}
+
 bool initEspNow() {
+    // Step 1: Initialise WiFi in STA mode
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
-
-    // Ensure WiFi is started before setting channel
     delay(100);
 
-    esp_err_t err = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
-    if (err != ESP_OK) {
-        Serial.printf("# ERROR: esp_wifi_set_channel failed: 0x%X\n", err);
+    // Step 2: Set channel (WiFi must be started — WiFi.mode(WIFI_STA) does that)
+    if (!setChannelRobust(kEspNowChannel)) {
+        Serial.println("# ERROR: Failed to set WiFi channel!");
         return false;
     }
 
-    err = esp_now_init();
+    // Step 3: Init ESP-NOW
+    esp_err_t err = esp_now_init();
     if (err != ESP_OK) {
         Serial.printf("# ERROR: esp_now_init failed: 0x%X\n", err);
         return false;
     }
 
+    // Step 4: Register receive callback
     esp_now_register_recv_cb(onEspNowReceive);
 
-    // Verify actual channel
-    uint8_t primaryCh = 0;
-    wifi_second_chan_t secondCh;
-    esp_wifi_get_channel(&primaryCh, &secondCh);
-    Serial.printf("# WiFi channel verified: primary=%u\n", primaryCh);
-
+    Serial.println("# ESP-NOW receiver init OK (broadcast mode).");
     return true;
 }
 
-/**
- * Send an EncoderPacket over UART with a magic header (transparent pass-through).
- */
-void sendPacketUart(const EncoderPacket& packet) {
+void sendPacketUart(const EncoderPacket& pkt) {
     UartFrameHeader header = {kUartMagic,
                               static_cast<uint16_t>(sizeof(EncoderPacket))};
     Serial.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header));
-    Serial.write(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+    Serial.write(reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
 }
 }  // namespace
 
@@ -126,28 +163,32 @@ void setup() {
     Serial.begin(kUartBaudrate);
     Serial.setRxBufferSize(512);
     Serial.setTxBufferSize(512);
+    delay(300);
 
-    delay(200);  // Allow UART to settle
+    Serial.println("# ===== ESP-NOW Receiver (Broadcast) =====");
+    Serial.printf("# EncoderPacket size = %u bytes\n",
+                  (unsigned)sizeof(EncoderPacket));
 
     if (!initEspNow()) {
-        Serial.println("# ESP-NOW init failed!");
-    } else {
-        Serial.println("# ESP-NOW receiver initialised OK.");
+        Serial.println("# ESP-NOW init FAILED!");
     }
 
     WiFi.macAddress(gLocalMac);
-    if (kDebugSerial) {
-        Serial.printf("# Receiver MAC: %02X:%02X:%02X:%02X:%02X:%02X ch=%u\n",
-                      gLocalMac[0], gLocalMac[1], gLocalMac[2],
-                      gLocalMac[3], gLocalMac[4], gLocalMac[5],
-                      kEspNowChannel);
-    }
+    Serial.printf("# Receiver MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  gLocalMac[0], gLocalMac[1], gLocalMac[2],
+                  gLocalMac[3], gLocalMac[4], gLocalMac[5]);
+
+    uint8_t ch = 0;
+    wifi_second_chan_t sch;
+    esp_wifi_get_channel(&ch, &sch);
+    Serial.printf("# Current WiFi channel: %u\n", ch);
 }
 
 void loop() {
     EncoderPacket local;
     bool hasPacket = false;
     uint32_t rxCount = 0;
+    uint32_t rxBadLen = 0;
     uint32_t lastRxMs = 0;
     int lastLen = 0;
     uint8_t lastMac[6] = {};
@@ -160,12 +201,13 @@ void loop() {
         hasPacket = true;
     }
     rxCount = gRxCount;
+    rxBadLen = gRxBadLen;
     lastRxMs = gLastRxMs;
     lastLen = gLastLen;
     memcpy(lastMac, gLastMac, sizeof(lastMac));
     portEXIT_CRITICAL(&gPacketMux);
 
-    // Transparent pass-through: immediately forward received packet to UART
+    // Transparent pass-through: forward to UART immediately
     if (hasPacket) {
         sendPacketUart(local);
     }
@@ -174,11 +216,17 @@ void loop() {
         uint32_t now = millis();
         if (now - lastReportMs >= 1000) {
             lastReportMs = now;
+
+            uint8_t ch = 0;
+            wifi_second_chan_t sch;
+            esp_wifi_get_channel(&ch, &sch);
+
             Serial.printf(
-                "# ESP-NOW rx=%lu last_ms=%lu len=%d "
+                "# RX: cnt=%lu badlen=%lu last_ms=%lu len=%d ch=%u "
                 "mac=%02X:%02X:%02X:%02X:%02X:%02X\n",
                 static_cast<unsigned long>(rxCount),
-                static_cast<unsigned long>(lastRxMs), lastLen,
+                static_cast<unsigned long>(rxBadLen),
+                static_cast<unsigned long>(lastRxMs), lastLen, ch,
                 lastMac[0], lastMac[1], lastMac[2],
                 lastMac[3], lastMac[4], lastMac[5]);
         }
@@ -206,8 +254,9 @@ constexpr int kRs485TxPin = 33;
 constexpr int kRs485DeRePin = 25;
 constexpr uint32_t kRs485Baudrate = 2500000;
 
-// Update with receiver MAC address.
-constexpr uint8_t kPeerMac[6] = {0xA4, 0xF0, 0x0F, 0x1F, 0x04, 0xA0};
+// BROADCAST — no need to know receiver MAC
+constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
 constexpr uint8_t kEspNowChannel = 1;
 constexpr uint32_t kEspNowSendIntervalMs = 5;
 constexpr uint8_t kEncoderTaskCore = 1;
@@ -243,45 +292,74 @@ EncoderPacket packet;
 uint16_t values[MultiEncoder::kMaxEncoders];
 bool status[MultiEncoder::kMaxEncoders];
 
-volatile bool gSendOk = false;
+volatile uint32_t gSendOkCount = 0;
+volatile uint32_t gSendFailCount = 0;
+
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
+void onEspNowSent(const uint8_t* mac, esp_now_send_status_t sendStatus) {
+#else
+void onEspNowSent(const uint8_t* mac, esp_now_send_status_t sendStatus) {
+#endif
+    if (sendStatus == ESP_NOW_SEND_SUCCESS) {
+        gSendOkCount++;
+    } else {
+        gSendFailCount++;
+    }
+}
 
 /**
- * ESP-NOW send callback — used for diagnostics.
+ * Set WiFi channel with retry and verification.
  */
-void onEspNowSent(const uint8_t* mac, esp_now_send_status_t sendStatus) {
-    gSendOk = (sendStatus == ESP_NOW_SEND_SUCCESS);
+bool setChannelRobust(uint8_t channel, int maxRetries = 5) {
+    for (int attempt = 0; attempt < maxRetries; ++attempt) {
+        esp_err_t err =
+            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        if (err != ESP_OK) {
+            Serial.printf("# set_channel attempt %d failed: 0x%X\n",
+                          attempt + 1, err);
+            delay(100);
+            continue;
+        }
+
+        uint8_t actualCh = 0;
+        wifi_second_chan_t secondCh;
+        esp_wifi_get_channel(&actualCh, &secondCh);
+        if (actualCh == channel) {
+            Serial.printf("# Channel set to %u (verified, attempt %d)\n",
+                          actualCh, attempt + 1);
+            return true;
+        }
+
+        Serial.printf("# Channel mismatch: wanted %u got %u, retrying...\n",
+                      channel, actualCh);
+        delay(100);
+    }
+    return false;
 }
 
 /**
  * Initialise WiFi + ESP-NOW for the sender.
  *
- * CRITICAL FIX: The original code called esp_wifi_set_channel() BETWEEN
- * esp_wifi_stop() and esp_wifi_start(). The ESP-IDF WiFi driver requires
- * WiFi to be started before setting the channel. The call silently failed,
- * leaving the sender on the default channel (not channel 1), so the receiver
- * on channel 1 never received any data.
- *
- * Fixed sequence:
- *   1. WiFi.mode(WIFI_STA)       — initialises and starts WiFi
- *   2. WiFi.disconnect()          — disconnect from any AP
- *   3. esp_wifi_set_channel()     — set channel AFTER WiFi is started
+ * KEY CHANGES:
+ *   1. Removed esp_wifi_stop()/esp_wifi_start() — set_channel called
+ *      when WiFi is already running after WiFi.mode(WIFI_STA).
+ *   2. Uses BROADCAST peer (FF:FF:FF:FF:FF:FF) — receiver does not
+ *      need to be pre-configured.
+ *   3. Channel setting with retry and verification.
  */
 bool initEspNow() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.disconnect(true, true);
-
-    // FIX: Set channel AFTER WiFi is started (WiFi.mode already starts it).
-    //      Do NOT call esp_wifi_stop() before esp_wifi_set_channel().
     delay(100);
 
-    esp_err_t err = esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
-    if (err != ESP_OK) {
-        Serial.printf("# ERROR: esp_wifi_set_channel failed: 0x%X\n", err);
+    // Set channel AFTER WiFi is started
+    if (!setChannelRobust(kEspNowChannel)) {
+        Serial.println("# ERROR: Failed to set WiFi channel!");
         return false;
     }
 
-    err = esp_now_init();
+    esp_err_t err = esp_now_init();
     if (err != ESP_OK) {
         Serial.printf("# ERROR: esp_now_init failed: 0x%X\n", err);
         return false;
@@ -289,23 +367,21 @@ bool initEspNow() {
 
     esp_now_register_send_cb(onEspNowSent);
 
+    // Add BROADCAST peer
     esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, kPeerMac, sizeof(kPeerMac));
-    peerInfo.channel = kEspNowChannel;
+    memcpy(peerInfo.peer_addr, kBroadcastMac, 6);
+    peerInfo.channel = 0;  // 0 = use current channel for broadcast
     peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_STA;
 
     err = esp_now_add_peer(&peerInfo);
     if (err != ESP_OK) {
-        Serial.printf("# ERROR: esp_now_add_peer failed: 0x%X\n", err);
+        Serial.printf("# ERROR: esp_now_add_peer(broadcast) failed: 0x%X\n",
+                      err);
         return false;
     }
 
-    // Verify actual channel
-    uint8_t primaryCh = 0;
-    wifi_second_chan_t secondCh;
-    esp_wifi_get_channel(&primaryCh, &secondCh);
-    Serial.printf("# WiFi channel verified: primary=%u\n", primaryCh);
-
+    Serial.println("# ESP-NOW sender init OK (broadcast mode).");
     return true;
 }
 
@@ -313,8 +389,8 @@ void taskEspNowSender(void* parameter) {
     uint32_t lastSeq = 0;
     uint32_t lastSendMs = 0;
     bool pending = false;
-    uint32_t sendCount = 0;
-    uint32_t failCount = 0;
+    uint32_t localSendCount = 0;
+    uint32_t localFailCount = 0;
 
     while (true) {
         bool allOk = false;
@@ -326,7 +402,8 @@ void taskEspNowSender(void* parameter) {
                 packet.values[i] = values[i];
                 packet.status[i] = status[i] ? 1 : 0;
             }
-            for (uint8_t i = packet.count; i < MultiEncoder::kMaxEncoders; ++i) {
+            for (uint8_t i = packet.count; i < MultiEncoder::kMaxEncoders;
+                 ++i) {
                 packet.values[i] = 0;
                 packet.status[i] = 0;
             }
@@ -341,25 +418,34 @@ void taskEspNowSender(void* parameter) {
             pending = false;
 
             esp_err_t result = esp_now_send(
-                kPeerMac,
+                kBroadcastMac,
                 reinterpret_cast<const uint8_t*>(&packet),
                 sizeof(packet));
-            sendCount++;
+            localSendCount++;
 
             if (result != ESP_OK) {
-                failCount++;
+                localFailCount++;
             }
 
-            // Periodic sender diagnostics
+            // Periodic diagnostics
             static uint32_t lastDiagMs = 0;
             if (now - lastDiagMs >= 2000) {
                 lastDiagMs = now;
+
+                uint8_t ch = 0;
+                wifi_second_chan_t sch;
+                esp_wifi_get_channel(&ch, &sch);
+
                 Serial.printf(
-                    "# SENDER: seq=%lu sent=%lu fail=%lu lastOk=%d\n",
+                    "# TX: seq=%lu sent=%lu api_fail=%lu "
+                    "cb_ok=%lu cb_fail=%lu ch=%u pkt_size=%u\n",
                     static_cast<unsigned long>(packet.seq),
-                    static_cast<unsigned long>(sendCount),
-                    static_cast<unsigned long>(failCount),
-                    gSendOk ? 1 : 0);
+                    static_cast<unsigned long>(localSendCount),
+                    static_cast<unsigned long>(localFailCount),
+                    static_cast<unsigned long>(gSendOkCount),
+                    static_cast<unsigned long>(gSendFailCount),
+                    ch,
+                    (unsigned)sizeof(packet));
             }
         }
 
@@ -370,9 +456,11 @@ void taskEspNowSender(void* parameter) {
 
 void setup() {
     Serial.begin(2000000);
-    delay(200);
+    delay(300);
 
-    Serial.println("# --- ESP-NOW Encoder Sender ---");
+    Serial.println("# ===== ESP-NOW Encoder Sender (Broadcast) =====");
+    Serial.printf("# EncoderPacket size = %u bytes\n",
+                  (unsigned)sizeof(EncoderPacket));
 
     if (!encoder.begin(Serial2)) {
         Serial.println("# Encoder init failed.");
@@ -382,19 +470,20 @@ void setup() {
     encoder.start(kEncoderTaskCore, kEncoderTaskPriority, 4096);
 
     if (!initEspNow()) {
-        Serial.println("# ESP-NOW init failed!");
+        Serial.println("# ESP-NOW init FAILED!");
         return;
     }
 
-    // Print sender MAC so the receiver can be configured
     uint8_t mac[6];
     WiFi.macAddress(mac);
-    Serial.printf("# Sender MAC: %02X:%02X:%02X:%02X:%02X:%02X ch=%u\n",
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                  kEspNowChannel);
-    Serial.printf("# Target MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                  kPeerMac[0], kPeerMac[1], kPeerMac[2],
-                  kPeerMac[3], kPeerMac[4], kPeerMac[5]);
+    Serial.printf("# Sender MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    uint8_t ch = 0;
+    wifi_second_chan_t sch;
+    esp_wifi_get_channel(&ch, &sch);
+    Serial.printf("# Current WiFi channel: %u\n", ch);
+    Serial.printf("# Sending to: BROADCAST (FF:FF:FF:FF:FF:FF)\n");
 
     xTaskCreatePinnedToCore(
         taskEspNowSender,
